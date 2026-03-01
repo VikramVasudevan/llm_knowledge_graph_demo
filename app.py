@@ -18,7 +18,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # --- 2. Graph Navigation Logic ---
 
 def get_perspectives_from_graph(user_query):
-    # 1. Structured extraction
+    # 1. Structured extraction (Same as yours)
     extraction_prompt = f"""
     Identify entities in the query. 
     Scriptures: {['Divya Prabandham', 'Srimad Bhagavatham', 'Bhagavad Gita']} (examples)
@@ -37,7 +37,6 @@ def get_perspectives_from_graph(user_query):
     )
     ents = json.loads(response.choices[0].message.content)
     
-    # Normalize inputs (Title Case)
     params = {
         "scriptures": [s.strip() for s in ents.get('scriptures', [])],
         "locations": [l.strip().title() for l in ents.get('locations', [])],
@@ -45,27 +44,39 @@ def get_perspectives_from_graph(user_query):
         "authors": [a.strip().title() for a in ents.get('authors', [])]
     }
 
-    # 2. Execute flexible Cypher
-    # 2. Execute flexible Cypher (Improved for Case-Insensitivity)
+    # 2. Refined Cypher Query
+    # Logic: If a parameter is provided, it MUST match. 
+    # We also prioritize the specific scripture by adding an ORDER BY.
     cypher_query = """
-    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
-    WHERE 
-        (size($scriptures) = 0 OR ANY(x IN $scriptures WHERE toLower(s.title) CONTAINS toLower(x) OR toLower(s.name) CONTAINS toLower(x)))
-    
-    AND (size($locations) = 0 OR ANY(x IN $locations WHERE toLower(v.location) CONTAINS toLower(x) OR EXISTS {
-        MATCH (v)-[:LOCATED_AT]->(l:Location) WHERE toLower(l.name) CONTAINS toLower(x)
-    }))
-    
-    AND (size($topics) = 0 OR EXISTS {
-        MATCH (v)-[:DISCUSSES]->(t:Topic) WHERE ANY(x IN $topics WHERE toLower(t.name) CONTAINS toLower(x))
-    })
+        MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+        OPTIONAL MATCH (auth:Author)-[:AUTHORED]->(v) 
 
-    RETURN 
-        s.title AS scripture, 
-        v.relative_path AS verse_title, 
-        v.text as verse_text,
-        v.translation AS meaning
-    LIMIT 15
+        WITH v, s, auth,
+             CASE 
+                WHEN size($scriptures) > 0 AND ANY(x IN $scriptures WHERE toLower(s.title) CONTAINS toLower(x) OR toLower(s.name) CONTAINS toLower(x)) THEN 10 
+                ELSE 0 
+             END AS scripture_score,
+             CASE 
+                WHEN size($authors) > 0 AND ANY(x IN $authors WHERE toLower(auth.name) CONTAINS toLower(x) OR toLower(v.author) CONTAINS toLower(x)) THEN 10 
+                ELSE 0 
+             END AS author_score
+
+        // Filter: If the user provided specific entities, ONLY show results that match at least one
+        WHERE (size($scriptures) = 0 OR scripture_score > 0)
+          AND (size($authors) = 0 OR author_score > 0)
+          AND (size($topics) = 0 OR EXISTS {
+                MATCH (v)-[:DISCUSSES]->(t:Topic) WHERE ANY(x IN $topics WHERE toLower(t.name) CONTAINS toLower(x))
+          })
+
+        RETURN 
+            s.title AS scripture, 
+            v.relative_path AS verse_title, 
+            v.text as verse_text,
+            v.translation AS meaning,
+            COALESCE(auth.name, v.author) AS author
+        
+        ORDER BY (scripture_score + author_score) DESC
+        LIMIT 20
     """
     
     context_data = []
@@ -77,7 +88,7 @@ def get_perspectives_from_graph(user_query):
                 "verse": record["verse_title"],
                 "verse_text": record["verse_text"],
                 "meaning": record["meaning"],
-                "topic": "Search Result" # Placeholder
+                "topic": record["author"] if record["author"] else "Search Result"
             })
     
     return context_data, params
@@ -99,7 +110,7 @@ def bhashyam_chat(message, history):
                   f"I couldn't find any specific verses in my graph matching these parameters. " \
                   f"Please try a broader term or check if that scripture is currently migrated."
             return
-            
+
         # 2. Synthesize the Answer
         # We format the context so the LLM knows which scripture said what.
         formatted_context = ""
@@ -109,17 +120,22 @@ def bhashyam_chat(message, history):
         print("formatted_context", formatted_context)
 
         system_prompt = f"""
-            You are the Bhashyam AI Research Assistant. 
+            You are the Bhashyam AI Research Assistant, an expert in Sanatana Dharma.
             
+            ### OBJECTIVE:
+            Analyze the provided 'CONTEXT FROM GRAPH' to answer the user's question. 
+            Note: The context may use Sanskrit terms or traditional concepts that represent modern ideas (e.g., 'Leadership' relates to 'Śreṣṭha', 'Dharma', or 'Loka-saṅgraham').
+
             ### STRICT RULES:
-            1. ONLY use the 'CONTEXT FROM GRAPH' provided below to answer.
-            2. If the user asks a question that is NOT covered by the context, state: "My knowledge graph does not currently contain specific verses on this topic. Would you like me to search the web or broaden the topic?"
-            3. DO NOT use your internal training data to add new verses or stories.
-            4. You must cite the [Scripture Name] and [Verse Title] for every claim you make.
-            
+            1. ONLY use the provided 'CONTEXT FROM GRAPH'. 
+            2. INTERPRET the context: If a verse describes qualities of a great person or a king's duty, use that to answer questions about 'Leadership' or 'Governance'.
+            3. If the context is TRULY irrelevant (e.g., user asks about "Quantum Physics" and context is about "Conch shells"), state: "My knowledge graph does not currently contain specific verses on this topic. Would you like me to search the web or broaden the topic?"
+            4. DO NOT invent new verses. 
+            5. CITE the [Scripture Name] and [Verse Title] (e.g., Bhagavad Gita 3.21) for every point made.
+
             ### CONTEXT FROM GRAPH:
             {formatted_context}
-            
+
             ### USER QUESTION:
             {message}
             """
