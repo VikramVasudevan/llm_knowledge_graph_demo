@@ -40,16 +40,24 @@ def get_enrichment_stats():
             
             total = record["total"] or 1
             trans = record["with_trans"] or 0
-            percent = round((trans / total) * 100, 2)
+            wbw = record["with_wbw"] or 0
+            topics = record["with_topics"] or 0
+
+            # Calculate individual percentages
+            p_trans = round((trans / total) * 100, 2)
+            p_wbw = round((wbw / total) * 100, 2)
+            p_topics = round((topics / total) * 100, 2)
             
             return f"""
 ### 📊 Migration Progress
 - **Total Verses:** {total:,}
-- **Enriched (Trans):** {trans:,}
-- **Word-by-Word:** {record['with_wbw']:,}
-- **Linked Topics:** {record['with_topics']:,}
 
-**Current Completion:** {percent}%
+---
+- **Enriched (Trans):** {trans:,} ({p_trans}%)
+- **Word-by-Word:** {wbw:,} ({p_wbw}%)
+- **Linked Topics:** {topics:,} ({p_topics}%)
+
+**Overall Completion:** {p_trans}%
             """
     except Exception as e:
         return f"⚠️ Stats Error: {str(e)}"
@@ -89,6 +97,7 @@ def get_perspectives_from_graph(user_query):
         "locations": [l.strip().title() for l in ents.get("locations", [])],
     }
 
+    # Added v.word_by_word_native to the RETURN clause
     cypher_query = """
     MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
     OPTIONAL MATCH (auth:Author)-[:AUTHORED]->(v)
@@ -102,6 +111,7 @@ def get_perspectives_from_graph(user_query):
       AND (size($authors) = 0 OR a_score > 0)
     RETURN s.title AS scripture, v.relative_path AS verse_title, 
            v.text as verse_text, v.translation AS meaning, 
+           v.word_by_word_native AS wbw,
            COALESCE(auth.name, v.author) as author,
            (t_score + s_score + a_score) as total_score
     ORDER BY total_score DESC
@@ -112,12 +122,30 @@ def get_perspectives_from_graph(user_query):
     with driver.session() as session:
         result = session.run(cypher_query, **params)
         for record in result:
+            raw_meaning = record["meaning"] or ""
+            wbw_json = record["wbw"]
+            
+            # --- Format Word-by-Word ---
+            formatted_wbw = ""
+            if wbw_json:
+                try:
+                    # Parse the JSON string from Neo4j
+                    wbw_list = json.loads(wbw_json)
+                    if isinstance(wbw_list, list):
+                        # Create a string like "Word (Meaning), Word (Meaning)"
+                        wbw_parts = [f"{item.get('word', '')}: {item.get('meaning', '')}" for item in wbw_list]
+                        formatted_wbw = "\nWord-by-Word: " + " | ".join(wbw_parts)
+                except Exception as e:
+                    print(f"Error parsing WBW for {record['verse_title']}: {e}")
+
             context_data.append({
                 "scripture": record["scripture"],
                 "verse": record["verse_title"],
                 "verse_text": record["verse_text"],
-                "meaning": record["meaning"],
+                # Append formatted WBW to the translation meaning
+                "meaning": f"{raw_meaning}{formatted_wbw}",
             })
+            
     return context_data, params
 
 # --- 4. Chat Interface Logic ---
@@ -125,13 +153,18 @@ def get_perspectives_from_graph(user_query):
 def bhashyam_chat(message, history):
     try:
         context, identified_topics = get_perspectives_from_graph(message)
+
+        print("identified_topics = ", identified_topics)
         
         if not context:
-            return "🔍 No matching verses found in the graph for this query."
+            yield "🔍 No matching verses found in the graph for this query."
+            return
 
         formatted_context = ""
         for c in context:
             formatted_context += f"\nFROM [{c['scripture']}] ({c['verse']}): {c['verse_text']} : {c['meaning']}\n"
+
+        print("formatted_context = ", formatted_context)
 
         system_prompt = f"""
         You are the Bhashyam AI Research Assistant.
