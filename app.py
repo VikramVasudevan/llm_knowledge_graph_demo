@@ -28,49 +28,51 @@ def get_enrichment_stats():
     CALL () { MATCH (v1:Verse) WHERE v1.translation IS NOT NULL RETURN count(v1) AS with_trans }
     CALL () { MATCH (v2:Verse) WHERE v2.word_by_word_native IS NOT NULL RETURN count(v2) AS with_wbw }
     CALL () { MATCH (v3:Verse)-[:DISCUSSES]->(:Topic) RETURN count(DISTINCT v3) AS with_topics }
-    RETURN total, with_trans, with_wbw, with_topics
+    CALL () { MATCH (t:Topic) RETURN count(t) AS total_topics }
+    CALL () { MATCH (ot:Topic) WHERE NOT (ot)<-[:DISCUSSES]-() RETURN count(ot) AS orphaned_topics }
+    RETURN total, with_trans, with_wbw, with_topics, total_topics, orphaned_topics
     """
     try:
         with driver.session() as session:
             record = session.run(query).single()
             if not record: return "📊 Database empty."
+            
             total = record["total"] or 1
-            trans, wbw, topics = record["with_trans"], record["with_wbw"], record["with_topics"]
-            p_trans = round((trans / total) * 100, 2)
-            p_wbw = round((wbw / total) * 100, 2)
-            p_topics = round((topics / total) * 100, 2)
+            total_topics = record["total_topics"]
+            orphaned = record["orphaned_topics"]
+            
+            p_trans = round((record["with_trans"] / total) * 100, 2)
+            p_topics = round((record["with_topics"] / total) * 100, 2)
             
             return f"""
 ### 📊 Migration Progress
 - **Total Verses:** {total:,}
----
-- **Enriched (Trans):** {trans:,} ({p_trans}%)
-- **Word-by-Word:** {wbw:,} ({p_wbw}%)
-- **Linked Topics:** {topics:,} ({p_topics}%)
+- **Enriched:** {p_trans}%
+- **Linked Topics:** {p_topics}%
 
-**Overall Completion:** {p_trans}%
+### 🏷️ Topic Stats
+- **Total Topics:** {total_topics:,}
+- **Orphaned Topics:** {orphaned:,} 
+*(Topics with no verse links)*
             """
     except Exception as e: return f"⚠️ Stats Error: {str(e)}"
 
 def get_verses_for_topic(evt: gr.SelectData):
     global TOPIC_TO_NODES_MAP
-    # Get the clean name the user clicked
     clean_topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
-    
-    # Retrieve the raw node names we mapped earlier
     raw_names = TOPIC_TO_NODES_MAP.get(clean_topic_name, [])
     
     if not raw_names:
         return f"### No raw mapping found for: {clean_topic_name}", []
 
-    # Use 'IN' to match any of the original raw nodes
     query = """
     MATCH (t:Topic)<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
     WHERE t.name IN $raw_names
     RETURN s.title AS scripture, 
            v.relative_path AS verse, 
            v.text AS text, 
-           v.translation AS translation
+           v.translation AS translation,
+           v.word_by_word_native AS wbw
     LIMIT 5000
     """
 
@@ -79,11 +81,21 @@ def get_verses_for_topic(evt: gr.SelectData):
             result = session.run(query, raw_names=raw_names)
             details = []
             for r in result:
+                # Format Word-by-Word JSON
+                wbw_str = "N/A"
+                if r["wbw"]:
+                    try:
+                        wbw_list = json.loads(r["wbw"])
+                        wbw_str = " | ".join([f"{i.get('word','?')}: {i.get('meaning','?')}" for i in wbw_list])
+                    except:
+                        wbw_str = "Formatting Error"
+
                 details.append([
                     r["scripture"], 
                     r["verse"], 
                     r["text"], 
-                    r["translation"] or "No translation available"
+                    r["translation"] or "No translation available",
+                    wbw_str
                 ])
             
             if not details:
@@ -251,6 +263,7 @@ with gr.Blocks() as demo:
     gr.HTML("<h1 style='text-align: center;'>🕉️ Bhashyam AI - Research Suite</h1>")
     
     with gr.Tabs():
+        # --- Tab 1: Chat ---
         with gr.Tab("💬 Research Chat"):
             with gr.Row():
                 with gr.Column(scale=4):
@@ -259,54 +272,51 @@ with gr.Blocks() as demo:
                         msg = gr.Textbox(placeholder="Ask your query...", label="Ask Bhashyam", scale=9)
                         submit_btn = gr.Button("Send", variant="primary", scale=1)
                 with gr.Column(scale=1, variant="panel"):
+                    # This sidebar now contains the topic counts
                     stats_sidebar = gr.Markdown(get_enrichment_stats())
-                    refresh_btn = gr.Button("🔄 Refresh Stats")
+                    refresh_stats_btn = gr.Button("🔄 Refresh All Stats")
 
-        # Topics Tab
+        # --- Tab 2: Topics Index ---
         with gr.Tab("🏷️ Topics Index"):
             with gr.Row():
-                # --- Left Column: Search & Scrollable Table ---
                 with gr.Column(scale=2):
                     gr.Markdown("### 🔍 Filter & Browse")
-                    # Dataframe with a fixed height creates a scrollable area
+                    
+                    # Added a dedicated Refresh button for the Topic Table
+                    refresh_topics_btn = gr.Button("🔄 Refresh Topic List", size="sm")
+                    
                     topics_table = gr.Dataframe(
                         headers=["Topic Name", "Verse Count"],
                         datatype=["str", "number"],
                         value=get_all_topics_table(),
                         interactive=False,
                         show_search="search",
-                        column_widths=[200,50]
+                        column_widths=[200, 80],
                     )
-
-                # --- Right Column: Verse Details ---
                 with gr.Column(scale=4):
                     detail_header = gr.Markdown("### 📖 Topic Details\n*Select a topic on the left to view verses.*")
                     verse_detail_table = gr.Dataframe(
-                        headers=["Scripture", "Verse ID", "Original Text", "English Translation"],
-                        datatype=["str", "str", "str", "str"],
+                        headers=["Scripture", "Verse ID", "Original Text", "English Translation", "Word-by-Word"],
+                        datatype=["str", "str", "str", "str", "str"],
                         wrap=True,
-                        interactive=False
+                        interactive=False,
+                        # Redistributed: Metadata (20% total), Content (80% total)
+                        column_widths=["10%", "10%", "25%", "25%", "30%"]
                     )
+
+    # --- Event Bindings ---
+
+    # Refresh Statistics Sidebar
+    refresh_stats_btn.click(get_enrichment_stats, outputs=stats_sidebar)
+
+    # Refresh Topics Table
+    refresh_topics_btn.click(
+        fn=lambda: get_all_topics_table(), 
+        outputs=topics_table
+    )
 
     # Selecting a row updates the details
     topics_table.select(fn=get_verses_for_topic, outputs=[detail_header, verse_detail_table])
-
-    # Original logic for chatbot history (tuples)
-    def user_action(user_message, history):
-        return "", history + [[user_message, None]]
-
-    def bot_action(history):
-        user_message = history[-1][0]
-        bot_response = bhashyam_chat(user_message, history)
-        history[-1][1] = ""
-        for chunk in bot_response:
-            history[-1][1] = chunk
-            yield history
-
-    # Event Bindings
-    submit_btn.click(user_action, [msg, chatbot], [msg, chatbot]).then(bot_action, chatbot, chatbot)
-    msg.submit(user_action, [msg, chatbot], [msg, chatbot]).then(bot_action, chatbot, chatbot)
-    refresh_btn.click(get_enrichment_stats, outputs=stats_sidebar)
     
 if __name__ == "__main__":
     demo.queue().launch(theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"))
