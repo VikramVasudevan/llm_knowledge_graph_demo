@@ -10,3 +10,4 @@ wheels/
 .venv
 .env
 .gradio/certificate.pem
+llm_cache.db

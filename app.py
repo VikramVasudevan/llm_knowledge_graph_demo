@@ -6,6 +6,7 @@ from neo4j import GraphDatabase
 from openai import OpenAI
 import gradio as gr
 import re
+import sqlite3
 
 # --- 1. Setup & Environment ---
 load_dotenv()
@@ -20,6 +21,66 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
+
+def update_topic_everywhere(old_name, new_name):
+    new_topics_list = [t.strip() for t in new_name.split(",") if t.strip()]
+    if not new_topics_list:
+        return "⚠️ Error: New name cannot be empty."
+
+    # Use absolute path or ensure this is the SAME db the server uses
+    SQLITE_PATH = "llm_cache.db" 
+    conn = sqlite3.connect(SQLITE_PATH)
+    cursor = conn.cursor()
+
+    try:
+        # 1. Update SQLite Cache (Persistent Storage)
+        cursor.execute("SELECT hash, topics FROM keywords")
+        for h, topics_json in cursor.fetchall():
+            topics = json.loads(topics_json)
+            if old_name in topics:
+                updated = [t for t in topics if t != old_name]
+                for nt in new_topics_list:
+                    if nt not in updated: updated.append(nt)
+                cursor.execute("UPDATE keywords SET topics = ? WHERE hash = ?", 
+                               (json.dumps(updated, ensure_ascii=False), h))
+
+        cursor.execute("SELECT hash, data FROM verse_enrichment")
+        for h, data_json in cursor.fetchall():
+            data = json.loads(data_json)
+            if "topics" in data and old_name in data["topics"]:
+                existing = data["topics"]
+                updated = [t for t in existing if t != old_name]
+                for nt in new_topics_list:
+                    if nt not in updated: updated.append(nt)
+                data["topics"] = updated
+                cursor.execute("UPDATE verse_enrichment SET data = ? WHERE hash = ?", 
+                               (json.dumps(data, ensure_ascii=False), h))
+        conn.commit()
+
+        # 2. Update Neo4j (Graph Storage)
+        # We use a DETACH DELETE on the old topic to ensure it's gone
+        with driver.session() as session:
+            session.run("""
+                MATCH (oldT:Topic {name: $old_name})
+                OPTIONAL MATCH (v:Verse)-[r:DISCUSSES]->(oldT)
+                WITH oldT, collect(v) as verses
+                
+                UNWIND $new_list AS new_t_name
+                MERGE (newT:Topic {name: new_t_name})
+                
+                WITH verses, oldT, newT
+                UNWIND verses as v
+                MERGE (v)-[:DISCUSSES]->(newT)
+                
+                WITH oldT
+                DETACH DELETE oldT
+            """, {"old_name": old_name, "new_list": new_topics_list})
+
+        return f"✅ Successfully split '{old_name}' into {new_topics_list}"
+    except Exception as e:
+        return f"⚠️ Update Error: {str(e)}"
+    finally:
+        conn.close()
 
 def get_top_10_topics():
     topics = get_all_topics_table()
@@ -95,18 +156,7 @@ def get_verses_for_topic(evt: gr.SelectData):
             details = []
             for r in result:
                 # Format Word-by-Word JSON
-                wbw_str = "N/A"
-                if r["wbw"]:
-                    try:
-                        wbw_list = json.loads(r["wbw"])
-                        wbw_str = " | ".join(
-                            [
-                                f"{i.get('word','?')}: {i.get('meaning','?')}"
-                                for i in wbw_list
-                            ]
-                        )
-                    except:
-                        wbw_str = "Formatting Error"
+                wbw_str = format_wbw(r["wbw"]) or "N/A"
 
                 details.append(
                     [
@@ -128,56 +178,73 @@ def get_verses_for_topic(evt: gr.SelectData):
 
 def get_all_topics_table(search_query=""):
     global TOPIC_TO_NODES_MAP
+    excluded_scriptures = ["yt_metadata"]
+
+    # We pull the direct name from the Topic node
     query = """
-    MATCH (t:Topic)<-[r:DISCUSSES]-(:Verse)
+    MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)-[r:DISCUSSES]->(t:Topic)
+    WHERE NOT s.name IN $excluded_list
     RETURN t.name AS name, count(r) AS verse_count
     """
-
     try:
         with driver.session() as session:
-            result = session.run(query)
+            result = session.run(query, excluded_list=excluded_scriptures)
             aggregated_topics = {}
-            TOPIC_TO_NODES_MAP = {}  # Reset the map
-
-            numbered_p = re.compile(r"^\d+\.\s*")
-            bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
+            TOPIC_TO_NODES_MAP = {} 
 
             for record in result:
-                raw_node_name = record["name"]
+                raw_name = record["name"]
                 count = record["verse_count"]
-                if not raw_node_name:
-                    continue
+                if not raw_name: continue
 
-                clean_name = re.sub(r"[\[\]\"']", "", raw_node_name)
-                parts = re.split(r",|\n", clean_name)
+                # We Title Case the name for the UI table
+                display_name = raw_name.strip().title()
 
-                for p in parts:
-                    t = p.strip()
-                    t = numbered_p.sub("", t)
-                    t = bullet_p.sub("", t)
-                    t = t.strip("*:- ").title()
+                aggregated_topics[display_name] = aggregated_topics.get(display_name, 0) + count
+                
+                if display_name not in TOPIC_TO_NODES_MAP:
+                    TOPIC_TO_NODES_MAP[display_name] = []
+                if raw_name not in TOPIC_TO_NODES_MAP[display_name]:
+                    TOPIC_TO_NODES_MAP[display_name].append(raw_name)
 
-                    if t and len(t) > 1:
-                        # 1. Store the count
-                        aggregated_topics[t] = aggregated_topics.get(t, 0) + count
-
-                        # 2. Map the clean name back to the RAW name for the detail query
-                        if t not in TOPIC_TO_NODES_MAP:
-                            TOPIC_TO_NODES_MAP[t] = []
-                        if raw_node_name not in TOPIC_TO_NODES_MAP[t]:
-                            TOPIC_TO_NODES_MAP[t].append(raw_node_name)
-
-            # 3. Filter and Sort
             sorted_names = sorted(aggregated_topics.keys())
             if search_query:
-                sorted_names = [
-                    n for n in sorted_names if search_query.lower() in n.lower()
-                ]
+                sorted_names = [n for n in sorted_names if search_query.lower() in n.lower()]
 
             return [[name, aggregated_topics[name]] for name in sorted_names]
-
     except Exception as e:
         return [[f"Error: {e}", 0]]
+
+def format_wbw(wbw_data):
+    """Safely converts WBW data (list or JSON string) into a readable string."""
+    if not wbw_data:
+        return ""
+
+    # Case 1: Already a list (driver-parsed)
+    if isinstance(wbw_data, list):
+        items = wbw_data
+    # Case 2: It's a string (needs parsing)
+    elif isinstance(wbw_data, str):
+        if wbw_data.strip().startswith("["):
+            try:
+                items = json.loads(wbw_data)
+            except:
+                return wbw_data  # Fallback to raw string
+        else:
+            return wbw_data  # It's a plain string
+    else:
+        return str(wbw_data)
+
+    # Format the list items
+    try:
+        parts = [
+            f"{i.get('word', '')}: {i.get('meaning', '')}"
+            for i in items
+            if isinstance(i, dict)
+        ]
+        return " | ".join(parts)
+    except:
+        return str(wbw_data)
 
 
 # --- 3. Original Perspectives & Chat Logic ---
@@ -216,56 +283,44 @@ def get_perspectives_from_graph(user_query):
     }
 
     cypher_query = """
-    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
-    OPTIONAL MATCH (auth:Author)-[:AUTHORED]->(v)
-    OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
+    // 1. Find potential candidate verses first (Filter early)
+    MATCH (t:Topic)<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    WHERE (size($topics) = 0 OR t.name IN $topics)
+      AND (size($scriptures) = 0 OR s.name IN $scriptures)
     
-    WITH v, s, auth, t,
-         CASE WHEN size($topics) > 0 AND t.name IN $topics THEN 200 ELSE 0 END as t_score,
-         CASE WHEN size($scriptures) > 0 AND s.name IN $scriptures THEN 100 ELSE 0 END as s_score,
-         CASE WHEN size($authors) > 0 AND auth.name IN $authors THEN 150 ELSE 0 END as a_score
+    // 2. Calculate scores for candidates only
+    WITH v, s, 
+         CASE WHEN t.name IN $topics THEN 200 ELSE 0 END as t_score
     
-    WHERE (size($topics) = 0 OR t_score > 0)
-      AND (size($scriptures) = 0 OR s_score > 0)
-      AND (size($authors) = 0 OR a_score > 0)
-
-    // Group by Scripture and pick the top 2 for each
-    WITH s, v, auth, (t_score + s_score + a_score) as total_score
-    ORDER BY total_score DESC
+    // 3. Group by Scripture and use collect/slice on a smaller set
+    WITH s, v, t_score
+    ORDER BY t_score DESC
+    
     WITH s, collect({
         verse_title: v.relative_path, 
         verse_text: v.text, 
         meaning: v.translation, 
-        wbw: v.word_by_word_native,
-        author: COALESCE(auth.name, v.author),
-        score: total_score
+        wbw: v.word_by_word_native
     })[0..2] as top_verses
     
     UNWIND top_verses as record
     RETURN s.title AS scripture, record.verse_title AS verse_title, 
            record.verse_text as verse_text, record.meaning AS meaning, 
-           record.wbw AS wbw, record.author as author, record.score as total_score
-    ORDER BY total_score DESC
+           record.wbw AS wbw
     LIMIT 20
     """
+
     context_data = []
     with driver.session() as session:
         result = session.run(cypher_query, **params)
         for record in result:
             raw_meaning = record["meaning"] or ""
-            wbw_json = record["wbw"]
-            formatted_wbw = ""
-            if wbw_json:
-                try:
-                    wbw_list = json.loads(wbw_json)
-                    if isinstance(wbw_list, list):
-                        wbw_parts = [
-                            f"{item.get('word', '')}: {item.get('meaning', '')}"
-                            for item in wbw_list
-                        ]
-                        formatted_wbw = "\nWord-by-Word: " + " | ".join(wbw_parts)
-                except Exception as e:
-                    print(f"Error parsing WBW: {e}")
+            wbw_raw = record["wbw"]
+
+            # Use the helper!
+            formatted_wbw = format_wbw(wbw_raw)
+            if formatted_wbw:
+                formatted_wbw = "\nWord-by-Word: " + formatted_wbw
 
             context_data.append(
                 {
@@ -363,6 +418,19 @@ with gr.Blocks() as demo:
                     # Added a dedicated Refresh button for the Topic Table
                     refresh_topics_btn = gr.Button("🔄 Refresh Topic List", size="sm")
 
+                    # --- RENAME PANEL ---
+                    with gr.Accordion("⚙️ Rename Topic", open=False):
+                        old_name_input = gr.Textbox(
+                            label="Selected Topic", interactive=False
+                        )
+                        new_name_input = gr.Textbox(
+                            label="New Name", placeholder="Type new name..."
+                        )
+                        rename_btn = gr.Button(
+                            "Apply Rename Everywhere", variant="stop"
+                        )
+                        rename_status = gr.Markdown("")
+
                     topics_table = gr.Dataframe(
                         headers=["Topic Name", "Verse Count"],
                         datatype=["str", "number"],
@@ -398,9 +466,36 @@ with gr.Blocks() as demo:
     # Refresh Topics Table
     refresh_topics_btn.click(fn=lambda: get_all_topics_table(), outputs=topics_table)
 
-    # Selecting a row updates the details
+    rename_btn.click(
+        fn=update_topic_everywhere,
+        inputs=[old_name_input, new_name_input],
+        outputs=rename_status
+    ).then(
+        fn=lambda: get_all_topics_table(), # Refresh the table automatically
+        outputs=topics_table
+    )
+
+    # 1. Update the helper to return all 4 necessary components
+    def select_topic_for_rename(evt: gr.SelectData):
+        # Get the clean topic name
+        topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
+        
+        # Call the existing verse fetcher logic
+        header, details = get_verses_for_topic(evt)
+        
+        # Return: 
+        # 1. Topic name for 'old_name_input'
+        # 2. Empty string for 'new_name_input' (to clear previous typing)
+        # 3. Header markdown for 'detail_header'
+        # 4. Verse list for 'verse_detail_table'
+        return topic_name, "", header, details
+
+    # 2. Rebind the select event to the new helper
+    # Make sure to remove the old topics_table.select(fn=get_verses_for_topic...) 
+    # and replace it with this:
     topics_table.select(
-        fn=get_verses_for_topic, outputs=[detail_header, verse_detail_table]
+        fn=select_topic_for_rename, 
+        outputs=[old_name_input, new_name_input, detail_header, verse_detail_table]
     )
 
     # --- Chatbot Event Logic ---
