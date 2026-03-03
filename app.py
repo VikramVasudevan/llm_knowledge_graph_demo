@@ -448,7 +448,7 @@ with gr.Blocks() as demo:
                             label="New Name", placeholder="Type new name..."
                         )
                         rename_btn = gr.Button(
-                            "Apply Rename Everywhere", variant="stop"
+                            "Apply Rename Everywhere", variant="stop", interactive=False
                         )
                         rename_status = gr.Markdown("")
 
