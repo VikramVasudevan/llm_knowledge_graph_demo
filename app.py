@@ -50,12 +50,15 @@ def get_enrichment_stats():
     except Exception as e: return f"⚠️ Stats Error: {str(e)}"
 
 def get_verses_for_topic(evt: gr.SelectData):
-    # evt.value will be the Topic Name from the first column
+    # evt.value will be the Topic Name from the selected cell
     topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
     
     query = """
     MATCH (t:Topic {name: $tname})<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
-    RETURN s.title AS scripture, v.relative_path AS verse, v.text AS text
+    RETURN s.title AS scripture, 
+           v.relative_path AS verse, 
+           v.text AS text, 
+           v.translation AS translation
     LIMIT 50
     """
     try:
@@ -63,7 +66,13 @@ def get_verses_for_topic(evt: gr.SelectData):
             result = session.run(query, tname=topic_name)
             details = []
             for r in result:
-                details.append([r["scripture"], r["verse"], r["text"]])
+                # Adding the translation as the 4th element in the row
+                details.append([
+                    r["scripture"], 
+                    r["verse"], 
+                    r["text"], 
+                    r["translation"] or "No translation available"
+                ])
             
             if not details:
                 return f"### No verses found for: {topic_name}", []
@@ -72,8 +81,10 @@ def get_verses_for_topic(evt: gr.SelectData):
     except Exception as e:
         return f"⚠️ Error: {str(e)}", []
 
-def get_topics_table(page=0, search_query=""):
-    page_size = 25
+import re
+
+def get_all_topics_table(search_query=""):
+    # We fetch all topics because the deduplication happens in Python
     query = """
     MATCH (t:Topic)<-[r:DISCUSSES]-(:Verse)
     RETURN t.name AS name, count(r) AS verse_count
@@ -84,44 +95,34 @@ def get_topics_table(page=0, search_query=""):
             result = session.run(query)
             aggregated_topics = {}
             
-            # Cleaning patterns
-            numbered_list_pattern = re.compile(r"^\d+\.\s*")
-            bullet_pattern = re.compile(r"^[ \t]*[-*:]+[ \t]*")
+            # Cleaning patterns for nested lists and bullets
+            numbered_p = re.compile(r"^\d+\.\s*")
+            bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
 
             for record in result:
                 name = record["name"]
                 count = record["verse_count"]
                 if not name: continue
                 
+                # Strip stringified brackets and split
                 clean_name = re.sub(r"[\[\]\"']", "", name)
                 parts = re.split(r',|\n', clean_name)
                 
                 for p in parts:
                     t = p.strip()
-                    t = numbered_list_pattern.sub("", t)
-                    t = bullet_pattern.sub("", t)
-                    t = t.strip("*:- ")
+                    t = numbered_p.sub("", t)
+                    t = bullet_p.sub("", t)
+                    t = t.strip("*:- ").title()
                     
-                    token = t.title()
-                    # Apply search filter if provided
-                    if search_query and search_query.lower() not in token.lower():
+                    if search_query and search_query.lower() not in t.lower():
                         continue
                         
-                    if token and len(token) > 1:
-                        aggregated_topics[token] = aggregated_topics.get(token, 0) + count
+                    if t and len(t) > 1:
+                        aggregated_topics[t] = aggregated_topics.get(t, 0) + count
 
-            # Sort and Paginate
-            sorted_topic_names = sorted(aggregated_topics.keys())
-            start = page * page_size
-            end = start + page_size
-            page_items = sorted_topic_names[start:end]
-            
-            # Format as rows for gr.Dataframe
-            table_data = []
-            for name in page_items:
-                table_data.append([name, aggregated_topics[name]])
-            
-            return table_data if table_data else [["No topics found", 0]]
+            # Sort alphabetically for the final table
+            sorted_names = sorted(aggregated_topics.keys())
+            return [[name, aggregated_topics[name]] for name in sorted_names]
             
     except Exception as e:
         return [[f"Error: {e}", 0]]
@@ -245,31 +246,34 @@ with gr.Blocks() as demo:
                     stats_sidebar = gr.Markdown(get_enrichment_stats())
                     refresh_btn = gr.Button("🔄 Refresh Stats")
 
+        # Topics Tab
         with gr.Tab("🏷️ Topics Index"):
-            current_page = gr.State(0)
-            
             with gr.Row():
+                # --- Left Column: Search & Scrollable Table ---
                 with gr.Column(scale=2):
-                    gr.Markdown("### 1. Select a Topic")
-                    topic_search = gr.Textbox(placeholder="Filter topics...", label="Search Topics")
+                    gr.Markdown("### 🔍 Filter & Browse")
+                    # Dataframe with a fixed height creates a scrollable area
                     topics_table = gr.Dataframe(
                         headers=["Topic Name", "Verse Count"],
                         datatype=["str", "number"],
-                        value=get_topics_table(0),
-                        interactive=False
+                        value=get_all_topics_table(),
+                        interactive=False,
+                        show_search="search",
+                        column_widths=[200,50]
                     )
-                    with gr.Row():
-                        prev_btn = gr.Button("⬅️ Previous")
-                        next_btn = gr.Button("Next ➡️")
 
-                with gr.Column(scale=3):
-                    detail_header = gr.Markdown("### 2. Topic Details\n*Click a row on the left to view verses.*")
+                # --- Right Column: Verse Details ---
+                with gr.Column(scale=4):
+                    detail_header = gr.Markdown("### 📖 Topic Details\n*Select a topic on the left to view verses.*")
                     verse_detail_table = gr.Dataframe(
-                        headers=["Scripture", "Verse ID", "Text"],
-                        datatype=["str", "str", "str"],
-                        wrap=True, # Important for reading long verse texts
+                        headers=["Scripture", "Verse ID", "Original Text", "English Translation"],
+                        datatype=["str", "str", "str", "str"],
+                        wrap=True,
                         interactive=False
                     )
+
+    # Selecting a row updates the details
+    topics_table.select(fn=get_verses_for_topic, outputs=[detail_header, verse_detail_table])
 
     # Original logic for chatbot history (tuples)
     def user_action(user_message, history):
@@ -288,23 +292,5 @@ with gr.Blocks() as demo:
     msg.submit(user_action, [msg, chatbot], [msg, chatbot]).then(bot_action, chatbot, chatbot)
     refresh_btn.click(get_enrichment_stats, outputs=stats_sidebar)
     
-    # --- New Event Bindings for Table ---
-    def move_page_table(page, delta, search):
-        new_page = max(0, page + delta)
-        return new_page, get_topics_table(new_page, search)
-
-    def filter_topics(search):
-        return 0, get_topics_table(0, search)
-
-    next_btn.click(move_page_table, [current_page, gr.State(1), topic_search], [current_page, topics_table])
-    prev_btn.click(move_page_table, [current_page, gr.State(-1), topic_search], [current_page, topics_table])
-    topic_search.submit(filter_topics, inputs=topic_search, outputs=[current_page, topics_table])
-    topics_table.select(
-        fn=get_verses_for_topic,
-        outputs=[detail_header, verse_detail_table]
-    )    
-
-
-
 if __name__ == "__main__":
     demo.queue().launch(theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"))
