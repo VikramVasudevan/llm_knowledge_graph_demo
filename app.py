@@ -85,7 +85,7 @@ def update_topic_everywhere(old_name, new_name):
 def get_top_10_topics():
     topics = get_all_topics_table()
     # Sort by count descending and take top 10
-    top_10 = sorted(topics, key=lambda x: x[1], reverse=True)[:25]
+    top_10 = sorted(topics, key=lambda x: x[1], reverse=True)[:28]
 
     # Format for gr.Chatbot: List of lists of message dicts
     # Each 'example' is actually a full conversation start
