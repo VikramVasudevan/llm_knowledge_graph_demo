@@ -1,6 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
+from gradio.components.chatbot import ExampleMessage
 from neo4j import GraphDatabase
 from openai import OpenAI
 import gradio as gr
@@ -19,7 +20,16 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
-# --- 2. Database Stats & Topic Logic ---
+
+def get_top_10_topics():
+    topics = get_all_topics_table()
+    # Sort by count descending and take top 10
+    top_10 = sorted(topics, key=lambda x: x[1], reverse=True)[:25]
+
+    # Format for gr.Chatbot: List of lists of message dicts
+    # Each 'example' is actually a full conversation start
+    return [ExampleMessage({"text": t[0]}) for t in top_10]
+
 
 def get_enrichment_stats():
     query = """
@@ -35,15 +45,16 @@ def get_enrichment_stats():
     try:
         with driver.session() as session:
             record = session.run(query).single()
-            if not record: return "📊 Database empty."
-            
+            if not record:
+                return "📊 Database empty."
+
             total = record["total"] or 1
             total_topics = record["total_topics"]
             orphaned = record["orphaned_topics"]
-            
+
             p_trans = round((record["with_trans"] / total) * 100, 2)
             p_topics = round((record["with_topics"] / total) * 100, 2)
-            
+
             return f"""
 ### 📊 Migration Progress
 - **Total Verses:** {total:,}
@@ -55,13 +66,15 @@ def get_enrichment_stats():
 - **Orphaned Topics:** {orphaned:,} 
 *(Topics with no verse links)*
             """
-    except Exception as e: return f"⚠️ Stats Error: {str(e)}"
+    except Exception as e:
+        return f"⚠️ Stats Error: {str(e)}"
+
 
 def get_verses_for_topic(evt: gr.SelectData):
     global TOPIC_TO_NODES_MAP
     clean_topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
     raw_names = TOPIC_TO_NODES_MAP.get(clean_topic_name, [])
-    
+
     if not raw_names:
         return f"### No raw mapping found for: {clean_topic_name}", []
 
@@ -86,24 +99,32 @@ def get_verses_for_topic(evt: gr.SelectData):
                 if r["wbw"]:
                     try:
                         wbw_list = json.loads(r["wbw"])
-                        wbw_str = " | ".join([f"{i.get('word','?')}: {i.get('meaning','?')}" for i in wbw_list])
+                        wbw_str = " | ".join(
+                            [
+                                f"{i.get('word','?')}: {i.get('meaning','?')}"
+                                for i in wbw_list
+                            ]
+                        )
                     except:
                         wbw_str = "Formatting Error"
 
-                details.append([
-                    r["scripture"], 
-                    r["verse"], 
-                    r["text"], 
-                    r["translation"] or "No translation available",
-                    wbw_str
-                ])
-            
+                details.append(
+                    [
+                        r["scripture"],
+                        r["verse"],
+                        r["text"],
+                        r["translation"] or "No translation available",
+                        wbw_str,
+                    ]
+                )
+
             if not details:
                 return f"### No verses found for: {clean_topic_name}", []
-            
+
             return f"### 📖 Verses discussing: {clean_topic_name}", details
     except Exception as e:
         return f"⚠️ Error: {str(e)}", []
+
 
 def get_all_topics_table(search_query=""):
     global TOPIC_TO_NODES_MAP
@@ -111,34 +132,35 @@ def get_all_topics_table(search_query=""):
     MATCH (t:Topic)<-[r:DISCUSSES]-(:Verse)
     RETURN t.name AS name, count(r) AS verse_count
     """
-    
+
     try:
         with driver.session() as session:
             result = session.run(query)
             aggregated_topics = {}
-            TOPIC_TO_NODES_MAP = {} # Reset the map
-            
+            TOPIC_TO_NODES_MAP = {}  # Reset the map
+
             numbered_p = re.compile(r"^\d+\.\s*")
             bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
 
             for record in result:
                 raw_node_name = record["name"]
                 count = record["verse_count"]
-                if not raw_node_name: continue
-                
+                if not raw_node_name:
+                    continue
+
                 clean_name = re.sub(r"[\[\]\"']", "", raw_node_name)
-                parts = re.split(r',|\n', clean_name)
-                
+                parts = re.split(r",|\n", clean_name)
+
                 for p in parts:
                     t = p.strip()
                     t = numbered_p.sub("", t)
                     t = bullet_p.sub("", t)
                     t = t.strip("*:- ").title()
-                    
+
                     if t and len(t) > 1:
                         # 1. Store the count
                         aggregated_topics[t] = aggregated_topics.get(t, 0) + count
-                        
+
                         # 2. Map the clean name back to the RAW name for the detail query
                         if t not in TOPIC_TO_NODES_MAP:
                             TOPIC_TO_NODES_MAP[t] = []
@@ -148,14 +170,18 @@ def get_all_topics_table(search_query=""):
             # 3. Filter and Sort
             sorted_names = sorted(aggregated_topics.keys())
             if search_query:
-                sorted_names = [n for n in sorted_names if search_query.lower() in n.lower()]
-            
+                sorted_names = [
+                    n for n in sorted_names if search_query.lower() in n.lower()
+                ]
+
             return [[name, aggregated_topics[name]] for name in sorted_names]
-            
+
     except Exception as e:
         return [[f"Error: {e}", 0]]
 
+
 # --- 3. Original Perspectives & Chat Logic ---
+
 
 def get_perspectives_from_graph(user_query):
     # This is your original function exactly as sent
@@ -193,20 +219,34 @@ def get_perspectives_from_graph(user_query):
     MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
     OPTIONAL MATCH (auth:Author)-[:AUTHORED]->(v)
     OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
+    
     WITH v, s, auth, t,
          CASE WHEN size($topics) > 0 AND t.name IN $topics THEN 200 ELSE 0 END as t_score,
          CASE WHEN size($scriptures) > 0 AND s.name IN $scriptures THEN 100 ELSE 0 END as s_score,
          CASE WHEN size($authors) > 0 AND auth.name IN $authors THEN 150 ELSE 0 END as a_score
+    
     WHERE (size($topics) = 0 OR t_score > 0)
       AND (size($scriptures) = 0 OR s_score > 0)
       AND (size($authors) = 0 OR a_score > 0)
-    RETURN s.title AS scripture, v.relative_path AS verse_title, 
-           v.text as verse_text, v.translation AS meaning, 
-           v.word_by_word_native AS wbw,
-           COALESCE(auth.name, v.author) as author,
-           (t_score + s_score + a_score) as total_score
+
+    // Group by Scripture and pick the top 2 for each
+    WITH s, v, auth, (t_score + s_score + a_score) as total_score
     ORDER BY total_score DESC
-    LIMIT 15
+    WITH s, collect({
+        verse_title: v.relative_path, 
+        verse_text: v.text, 
+        meaning: v.translation, 
+        wbw: v.word_by_word_native,
+        author: COALESCE(auth.name, v.author),
+        score: total_score
+    })[0..2] as top_verses
+    
+    UNWIND top_verses as record
+    RETURN s.title AS scripture, record.verse_title AS verse_title, 
+           record.verse_text as verse_text, record.meaning AS meaning, 
+           record.wbw AS wbw, record.author as author, record.score as total_score
+    ORDER BY total_score DESC
+    LIMIT 20
     """
     context_data = []
     with driver.session() as session:
@@ -219,18 +259,24 @@ def get_perspectives_from_graph(user_query):
                 try:
                     wbw_list = json.loads(wbw_json)
                     if isinstance(wbw_list, list):
-                        wbw_parts = [f"{item.get('word', '')}: {item.get('meaning', '')}" for item in wbw_list]
+                        wbw_parts = [
+                            f"{item.get('word', '')}: {item.get('meaning', '')}"
+                            for item in wbw_list
+                        ]
                         formatted_wbw = "\nWord-by-Word: " + " | ".join(wbw_parts)
                 except Exception as e:
                     print(f"Error parsing WBW: {e}")
 
-            context_data.append({
-                "scripture": record["scripture"],
-                "verse": record["verse_title"],
-                "verse_text": record["verse_text"],
-                "meaning": f"{raw_meaning}{formatted_wbw}",
-            })
+            context_data.append(
+                {
+                    "scripture": record["scripture"],
+                    "verse": record["verse_title"],
+                    "verse_text": record["verse_text"],
+                    "meaning": f"{raw_meaning}{formatted_wbw}",
+                }
+            )
     return context_data, params
+
 
 def bhashyam_chat(message, history):
     try:
@@ -243,10 +289,31 @@ def bhashyam_chat(message, history):
         for c in context:
             formatted_context += f"\nFROM [{c['scripture']}] ({c['verse']}): {c['verse_text']} : {c['meaning']}\n"
 
-        system_prompt = f"You are the Bhashyam AI Research Assistant. Use 'CONTEXT FROM GRAPH' to answer. Cite [Scripture Name] and [Verse Title].\n### CONTEXT FROM GRAPH:\n{formatted_context}"
+        system_prompt = f"""
+            You are the Bhashyam AI Research Assistant, a scholar of Sanatana Dharma scriptures.
+            Use the 'CONTEXT FROM GRAPH' provided below to answer the user's query.
+
+            ### RULES:
+            1. COMPARISON: Since you have references from different scriptures, highlight similarities or nuances between them in your summary.
+            2. CITATION: Always cite the [Scripture Name] and [Verse Title].
+            3. LYRICS: For every verse you reference, you MUST include the original text (Lyrics/Sanskrit/Tamil) followed by its translation.
+            4. ATOMICITY: Focus on the specific philosophical topics linked to these verses.
+
+            ### RESPONSE FORMAT:
+            - Comparative summary of the concept across the provided scriptures.
+            - [Scripture Name] [Verse Title]
+            - **Original Text:** [Insert Verse Text here]
+            - **Meaning:** [Insert English Translation here]
+            
+            ### CONTEXT FROM GRAPH:
+            {formatted_context}
+            """
         stream = client.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message},
+            ],
             stream=True,
         )
         partial_message = ""
@@ -257,22 +324,33 @@ def bhashyam_chat(message, history):
     except Exception as e:
         yield f"⚠️ Error: {str(e)}"
 
+
 # --- 4. Tabbed UI ---
 
 with gr.Blocks() as demo:
     gr.HTML("<h1 style='text-align: center;'>🕉️ Bhashyam AI - Research Suite</h1>")
-    
+
     with gr.Tabs():
         # --- Tab 1: Chat ---
         with gr.Tab("💬 Research Chat"):
             with gr.Row():
                 with gr.Column(scale=4):
-                    chatbot = gr.Chatbot(height=600, show_label=False)
+                    # Set type="messages" for compatibility with dict-based history
+                    chatbot = gr.Chatbot(
+                        height=600,
+                        show_label=False,
+                        placeholder="### 🔥 Trending Topics",
+                        examples=get_top_10_topics(),
+                    )
                     with gr.Row():
-                        msg = gr.Textbox(placeholder="Ask your query...", label="Ask Bhashyam", scale=9)
+                        msg = gr.Textbox(
+                            placeholder="Ask your query...",
+                            label="Ask Bhashyam",
+                            scale=9,
+                        )
                         submit_btn = gr.Button("Send", variant="primary", scale=1)
+
                 with gr.Column(scale=1, variant="panel"):
-                    # This sidebar now contains the topic counts
                     stats_sidebar = gr.Markdown(get_enrichment_stats())
                     refresh_stats_btn = gr.Button("🔄 Refresh All Stats")
 
@@ -281,10 +359,10 @@ with gr.Blocks() as demo:
             with gr.Row():
                 with gr.Column(scale=2):
                     gr.Markdown("### 🔍 Filter & Browse")
-                    
+
                     # Added a dedicated Refresh button for the Topic Table
                     refresh_topics_btn = gr.Button("🔄 Refresh Topic List", size="sm")
-                    
+
                     topics_table = gr.Dataframe(
                         headers=["Topic Name", "Verse Count"],
                         datatype=["str", "number"],
@@ -294,14 +372,22 @@ with gr.Blocks() as demo:
                         column_widths=[200, 80],
                     )
                 with gr.Column(scale=4):
-                    detail_header = gr.Markdown("### 📖 Topic Details\n*Select a topic on the left to view verses.*")
+                    detail_header = gr.Markdown(
+                        "### 📖 Topic Details\n*Select a topic on the left to view verses.*"
+                    )
                     verse_detail_table = gr.Dataframe(
-                        headers=["Scripture", "Verse ID", "Original Text", "English Translation", "Word-by-Word"],
+                        headers=[
+                            "Scripture",
+                            "Verse ID",
+                            "Original Text",
+                            "English Translation",
+                            "Word-by-Word",
+                        ],
                         datatype=["str", "str", "str", "str", "str"],
                         wrap=True,
                         interactive=False,
                         # Redistributed: Metadata (20% total), Content (80% total)
-                        column_widths=["10%", "10%", "25%", "25%", "30%"]
+                        column_widths=["10%", "10%", "25%", "25%", "30%"],
                     )
 
     # --- Event Bindings ---
@@ -310,13 +396,52 @@ with gr.Blocks() as demo:
     refresh_stats_btn.click(get_enrichment_stats, outputs=stats_sidebar)
 
     # Refresh Topics Table
-    refresh_topics_btn.click(
-        fn=lambda: get_all_topics_table(), 
-        outputs=topics_table
-    )
+    refresh_topics_btn.click(fn=lambda: get_all_topics_table(), outputs=topics_table)
 
     # Selecting a row updates the details
-    topics_table.select(fn=get_verses_for_topic, outputs=[detail_header, verse_detail_table])
-    
+    topics_table.select(
+        fn=get_verses_for_topic, outputs=[detail_header, verse_detail_table]
+    )
+
+    # --- Chatbot Event Logic ---
+    def user_action(user_message, history):
+        # New format: list of dicts
+        return "", history + [{"role": "user", "content": user_message}]
+
+    def bot_action(history):
+        user_message = history[-1]["content"]
+        bot_response = bhashyam_chat(user_message, history)
+
+        # Initialize the assistant message
+        history.append({"role": "assistant", "content": ""})
+
+        for chunk in bot_response:
+            history[-1]["content"] = chunk
+            yield history
+
+    # NEW: Handler for when a user clicks a Chatbot Example
+    def handle_example_click(evt: gr.SelectData, history):
+        # evt.value is the dictionary: {"text": "TopicName"}
+        topic_name = evt.value["text"]
+        user_message = (
+            f"What do our sanatana dharma scriptures say on the topic of '{topic_name}'"
+        )
+        # We reuse the user_action logic to add it to history
+        _, updated_history = user_action(user_message, history)
+        return updated_history
+
+    # Bind the 'Send' button and 'Enter' key
+    submit_btn.click(user_action, [msg, chatbot], [msg, chatbot]).then(
+        bot_action, chatbot, chatbot
+    )
+    msg.submit(user_action, [msg, chatbot], [msg, chatbot]).then(
+        bot_action, chatbot, chatbot
+    )
+    chatbot.example_select(handle_example_click, chatbot, chatbot).then(
+        bot_action, chatbot, chatbot
+    )
+
 if __name__ == "__main__":
-    demo.queue().launch(theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"))
+    demo.queue().launch(
+        theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"), share=True
+    )
