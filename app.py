@@ -16,6 +16,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
+# Global cache to keep the UI in sync with the Database
+TOPIC_TO_NODES_MAP = {}
+
 # --- 2. Database Stats & Topic Logic ---
 
 def get_enrichment_stats():
@@ -50,23 +53,32 @@ def get_enrichment_stats():
     except Exception as e: return f"⚠️ Stats Error: {str(e)}"
 
 def get_verses_for_topic(evt: gr.SelectData):
-    # evt.value will be the Topic Name from the selected cell
-    topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
+    global TOPIC_TO_NODES_MAP
+    # Get the clean name the user clicked
+    clean_topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
     
+    # Retrieve the raw node names we mapped earlier
+    raw_names = TOPIC_TO_NODES_MAP.get(clean_topic_name, [])
+    
+    if not raw_names:
+        return f"### No raw mapping found for: {clean_topic_name}", []
+
+    # Use 'IN' to match any of the original raw nodes
     query = """
-    MATCH (t:Topic {name: $tname})<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    MATCH (t:Topic)<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    WHERE t.name IN $raw_names
     RETURN s.title AS scripture, 
            v.relative_path AS verse, 
            v.text AS text, 
            v.translation AS translation
-    LIMIT 50
+    LIMIT 5000
     """
+
     try:
         with driver.session() as session:
-            result = session.run(query, tname=topic_name)
+            result = session.run(query, raw_names=raw_names)
             details = []
             for r in result:
-                # Adding the translation as the 4th element in the row
                 details.append([
                     r["scripture"], 
                     r["verse"], 
@@ -75,16 +87,14 @@ def get_verses_for_topic(evt: gr.SelectData):
                 ])
             
             if not details:
-                return f"### No verses found for: {topic_name}", []
+                return f"### No verses found for: {clean_topic_name}", []
             
-            return f"### 📖 Verses discussing: {topic_name}", details
+            return f"### 📖 Verses discussing: {clean_topic_name}", details
     except Exception as e:
         return f"⚠️ Error: {str(e)}", []
 
-import re
-
 def get_all_topics_table(search_query=""):
-    # We fetch all topics because the deduplication happens in Python
+    global TOPIC_TO_NODES_MAP
     query = """
     MATCH (t:Topic)<-[r:DISCUSSES]-(:Verse)
     RETURN t.name AS name, count(r) AS verse_count
@@ -94,18 +104,17 @@ def get_all_topics_table(search_query=""):
         with driver.session() as session:
             result = session.run(query)
             aggregated_topics = {}
+            TOPIC_TO_NODES_MAP = {} # Reset the map
             
-            # Cleaning patterns for nested lists and bullets
             numbered_p = re.compile(r"^\d+\.\s*")
             bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
 
             for record in result:
-                name = record["name"]
+                raw_node_name = record["name"]
                 count = record["verse_count"]
-                if not name: continue
+                if not raw_node_name: continue
                 
-                # Strip stringified brackets and split
-                clean_name = re.sub(r"[\[\]\"']", "", name)
+                clean_name = re.sub(r"[\[\]\"']", "", raw_node_name)
                 parts = re.split(r',|\n', clean_name)
                 
                 for p in parts:
@@ -114,14 +123,21 @@ def get_all_topics_table(search_query=""):
                     t = bullet_p.sub("", t)
                     t = t.strip("*:- ").title()
                     
-                    if search_query and search_query.lower() not in t.lower():
-                        continue
-                        
                     if t and len(t) > 1:
+                        # 1. Store the count
                         aggregated_topics[t] = aggregated_topics.get(t, 0) + count
+                        
+                        # 2. Map the clean name back to the RAW name for the detail query
+                        if t not in TOPIC_TO_NODES_MAP:
+                            TOPIC_TO_NODES_MAP[t] = []
+                        if raw_node_name not in TOPIC_TO_NODES_MAP[t]:
+                            TOPIC_TO_NODES_MAP[t].append(raw_node_name)
 
-            # Sort alphabetically for the final table
+            # 3. Filter and Sort
             sorted_names = sorted(aggregated_topics.keys())
+            if search_query:
+                sorted_names = [n for n in sorted_names if search_query.lower() in n.lower()]
+            
             return [[name, aggregated_topics[name]] for name in sorted_names]
             
     except Exception as e:
