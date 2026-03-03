@@ -28,7 +28,7 @@ def update_topic_everywhere(old_name, new_name):
         return "⚠️ Error: New name cannot be empty."
 
     # Use absolute path or ensure this is the SAME db the server uses
-    SQLITE_PATH = "llm_cache.db" 
+    SQLITE_PATH = "../bhashyamai_data_editor/llm_cache.db" 
     conn = sqlite3.connect(SQLITE_PATH)
     cursor = conn.cursor()
 
@@ -180,12 +180,15 @@ def get_all_topics_table(search_query=""):
     global TOPIC_TO_NODES_MAP
     excluded_scriptures = ["yt_metadata"]
 
-    # We pull the direct name from the Topic node
     query = """
     MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)-[r:DISCUSSES]->(t:Topic)
     WHERE NOT s.name IN $excluded_list
     RETURN t.name AS name, count(r) AS verse_count
     """
+    
+    numbered_p = re.compile(r"^\d+\.\s*")
+    bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
+
     try:
         with driver.session() as session:
             result = session.run(query, excluded_list=excluded_scriptures)
@@ -193,25 +196,43 @@ def get_all_topics_table(search_query=""):
             TOPIC_TO_NODES_MAP = {} 
 
             for record in result:
-                raw_name = record["name"]
+                raw_node_name = record["name"]
                 count = record["verse_count"]
-                if not raw_name: continue
+                if not raw_node_name: continue
 
-                # We Title Case the name for the UI table
-                display_name = raw_name.strip().title()
+                # 1. Strip brackets/quotes and split by commas/newlines
+                clean_name = re.sub(r"[\[\]\"']", "", raw_node_name)
+                parts = re.split(r',|\n', clean_name)
 
-                aggregated_topics[display_name] = aggregated_topics.get(display_name, 0) + count
-                
-                if display_name not in TOPIC_TO_NODES_MAP:
-                    TOPIC_TO_NODES_MAP[display_name] = []
-                if raw_name not in TOPIC_TO_NODES_MAP[display_name]:
-                    TOPIC_TO_NODES_MAP[display_name].append(raw_name)
+                for p in parts:
+                    t = p.strip()
+                    t = numbered_p.sub("", t) 
+                    t = bullet_p.sub("", t)   
+                    display_name = t.strip("*:- ").title()
+                    
+                    if display_name and len(display_name) > 1:
+                        # 2. Aggregate counts
+                        aggregated_topics[display_name] = aggregated_topics.get(display_name, 0) + count
 
-            sorted_names = sorted(aggregated_topics.keys())
+                        # 3. Map back to Raw Name
+                        if display_name not in TOPIC_TO_NODES_MAP:
+                            TOPIC_TO_NODES_MAP[display_name] = []
+                        if raw_node_name not in TOPIC_TO_NODES_MAP[display_name]:
+                            TOPIC_TO_NODES_MAP[display_name].append(raw_node_name)
+
+            # --- THE FIX IS HERE ---
+            # aggregated_topics.items() returns (name, count) tuples.
+            # We unpack them into a clean list of lists.
+            all_topics = [[name, count] for name, count in aggregated_topics.items()]
+            
             if search_query:
-                sorted_names = [n for n in sorted_names if search_query.lower() in n.lower()]
+                all_topics = [t for t in all_topics if search_query.lower() in t[0].lower()]
 
-            return [[name, aggregated_topics[name]] for name in sorted_names]
+            # Sort by Count DESC, then Name ASC
+            all_topics.sort(key=lambda x: (-x[1], x[0]))
+
+            return all_topics
+
     except Exception as e:
         return [[f"Error: {e}", 0]]
 
