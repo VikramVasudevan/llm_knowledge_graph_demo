@@ -21,6 +21,77 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
+def get_all_scriptures_table():
+    """Fetches all scriptures and the count of verses in each."""
+    query = """
+    MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)
+    RETURN s.title AS title, s.name AS internal_name, count(v) AS verse_count
+    ORDER BY s.title ASC
+    """
+    try:
+        with driver.session() as session:
+            result = session.run(query)
+            # We return internal_name as well but might hide it in the UI or use it for lookups
+            return [[r["title"], r["verse_count"], r["internal_name"]] for r in result]
+    except Exception as e:
+        return [[f"Error: {e}", 0, ""]]
+
+def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
+    selected_row = scripture_data.iloc[evt.index[0]]
+    scripture_title = selected_row["Scripture Title"]
+    internal_name = selected_row["internal_id"]
+
+    # Query to get both the verses and the enrichment stats for this specific scripture
+    query = """
+    MATCH (s:Scripture {name: $internal_name})<-[:PART_OF]-(v:Verse)
+    WITH s, v ORDER BY v.global_index ASC
+    
+    // Calculate stats
+    WITH s, collect(v) AS all_verses, count(v) AS total
+    OPTIONAL MATCH (v_t:Verse)-[:PART_OF]->(s) WHERE v_t.translation IS NOT NULL
+    WITH s, all_verses, total, count(v_t) AS t_count
+    OPTIONAL MATCH (v_w:Verse)-[:PART_OF]->(s) WHERE v_w.word_by_word_native IS NOT NULL
+    WITH s, all_verses, total, t_count, count(v_w) AS w_count
+    OPTIONAL MATCH (v_top:Verse)-[:PART_OF]->(s) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
+    WITH s, all_verses, total, t_count, w_count, count(DISTINCT v_top) AS top_count
+
+    RETURN all_verses, total, t_count, w_count, top_count
+    """
+    try:
+        with driver.session() as session:
+            record = session.run(query, internal_name=internal_name).single()
+            if not record:
+                return "### No data", "", []
+
+            total = record["total"] or 1
+            verses = record["all_verses"]
+            
+            # Calculate percentages
+            p_trans = round((record["t_count"] / total) * 100, 1)
+            p_wbw = round((record["w_count"] / total) * 100, 1)
+            p_topics = round((record["top_count"] / total) * 100, 1)
+
+            # Format Stats Markdown
+            stats_md = f"""
+| 🏷️ Topics Linked | 🔤 Word-by-Word | 🌐 Translation |
+|:---:|:---:|:---:|
+| **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |
+"""
+            
+            details = []
+            for v in verses:
+                details.append([
+                    v["relative_path"],
+                    v["text"],
+                    v["translation"] or "No translation",
+                    format_wbw(v["word_by_word_native"]) or "N/A"
+                ])
+            
+            header = f"### 📜 {scripture_title} ({total} Verses)"
+            return header, stats_md, details
+            
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}", "", []
 
 def update_topic_everywhere(old_name, new_name):
     new_topics_list = [t.strip() for t in new_name.split(",") if t.strip()]
@@ -479,6 +550,41 @@ with gr.Blocks() as demo:
                         column_widths=["10%", "10%", "25%", "25%", "30%"],
                     )
 
+        # --- Tab 3: Scripture Index ---
+        with gr.Tab("📜 Scripture Index"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 📚 Browse by Scripture")
+                    refresh_scripture_btn = gr.Button("🔄 Refresh List", size="sm")
+                    
+                    scripture_table = gr.Dataframe(
+                        headers=["Scripture Title", "Verse Count", "internal_id"],
+                        datatype=["str", "number", "str"],
+                        value=get_all_scriptures_table(),
+                        interactive=False,
+                        show_search="search",
+                        # We hide the 3rd column (internal_id) from the user
+                        column_widths=["70%", "30%", "0%"], 
+                    )
+                
+                with gr.Column(scale=4):
+                    scripture_detail_header = gr.Markdown(
+                        "### 📖 Scripture Content\n*Select a scripture on the left to view its verses in order.*"
+                    )
+                    scripture_enrichment_stats = gr.Markdown("Select a scripture to see enrichment progress.")
+                    scripture_verse_table = gr.Dataframe(
+                        headers=[
+                            "Verse ID",
+                            "Original Text",
+                            "English Translation",
+                            "Word-by-Word",
+                        ],
+                        datatype=["str", "str", "str", "str"],
+                        wrap=True,
+                        interactive=False,
+                        show_search="search",
+                        column_widths=["15%", "25%", "30%", "30%"],
+                    )
     # --- Event Bindings ---
 
     # Refresh Statistics Sidebar
@@ -555,6 +661,22 @@ with gr.Blocks() as demo:
     )
     chatbot.example_select(handle_example_click, chatbot, chatbot).then(
         bot_action, chatbot, chatbot
+    )
+    # Refresh Scripture List
+    refresh_scripture_btn.click(
+        fn=get_all_scriptures_table, 
+        outputs=scripture_table
+    )
+
+    # Scripture Table Selection Logic
+    scripture_table.select(
+        fn=get_verses_by_scripture,
+        inputs=[scripture_table],
+        outputs=[
+            scripture_detail_header, 
+            scripture_enrichment_stats,
+            scripture_verse_table
+        ]
     )
 
 if __name__ == "__main__":
