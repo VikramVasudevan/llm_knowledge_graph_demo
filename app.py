@@ -69,36 +69,47 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
     internal_name = selected_row["internal_id"]
 
     query = """
-    MATCH (s:Scripture {name: $internal_name})<-[:PART_OF]-(v:Verse)
-    WITH s, v ORDER BY v.unit_index ASC
+    MATCH (s:Scripture {name: $internal_name})
     
-    // 1. Calculate stats and collect verses
-    WITH s, count(v) AS total, collect({
-        relative_path: v.relative_path,
-        text: v.text,
-        translation: v.translation,
-        wbw: v.word_by_word_native,
-        topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name]
-    }) AS all_verses
+    // 1. Calculate stats using COUNT alone with new Variable Scope Clause
+    CALL (s) {
+        MATCH (s)<-[:PART_OF]-(v:Verse)
+        RETURN count(v) AS total
+    }
+    CALL (s) {
+        MATCH (s)<-[:PART_OF]-(v_t:Verse) WHERE v_t.translation IS NOT NULL
+        RETURN count(v_t) AS t_count
+    }
+    CALL (s) {
+        MATCH (s)<-[:PART_OF]-(v_w:Verse) 
+        WHERE v_w.word_by_word_native IS NOT NULL 
+          AND v_w.word_by_word_native <> "" 
+          AND v_w.word_by_word_native <> "[]" 
+          AND v_w.word_by_word_native <> []
+        RETURN count(v_w) AS w_count
+    }
+    CALL (s) {
+        MATCH (s)<-[:PART_OF]-(v_top:Verse) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
+        RETURN count(DISTINCT v_top) AS top_count
+    }
 
-    // 2. Calculate translation stats
-    OPTIONAL MATCH (v_t:Verse)-[:PART_OF]->(s) WHERE v_t.translation IS NOT NULL
-    WITH s, all_verses, total, count(v_t) AS t_count
-
-    // 3. Calculate WBW stats with strict check
-    OPTIONAL MATCH (v_w:Verse)-[:PART_OF]->(s) 
-    WHERE v_w.word_by_word_native IS NOT NULL 
-      AND v_w.word_by_word_native <> "" 
-      AND v_w.word_by_word_native <> "[]" 
-      AND v_w.word_by_word_native <> []
-    WITH s, all_verses, total, t_count, count(v_w) AS w_count
-
-    // 4. Calculate Topic stats
-    OPTIONAL MATCH (v_top:Verse)-[:PART_OF]->(s) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
-    WITH s, all_verses, total, t_count, w_count, count(DISTINCT v_top) AS top_count
-
-    // SLICE the collection here to only return the first 1000 for the UI
-    RETURN all_verses[0..1000] AS limited_verses, total, t_count, w_count, top_count
+    // 2. Fetch ONLY the first 500 verses for display
+    WITH s, total, t_count, w_count, top_count
+    MATCH (s)<-[:PART_OF]-(v:Verse)
+    WITH s, total, t_count, w_count, top_count, v
+    ORDER BY v.unit_index ASC
+    LIMIT 500
+    
+    // 3. Collect detailed info for the limited set
+    RETURN 
+        total, t_count, w_count, top_count,
+        collect({
+            relative_path: v.relative_path,
+            text: v.text,
+            translation: v.translation,
+            wbw: v.word_by_word_native,
+            topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name]
+        }) AS limited_verses
     """
     try:
         with driver.session() as session:
@@ -414,7 +425,6 @@ def format_wbw(wbw_data):
 def get_perspectives_from_graph(user_query):
     try:
         with driver.session() as session:
-            # Pre-fetch valid metadata for the LLM to use
             s_result = session.run("MATCH (s:Scripture) RETURN s.name AS name")
             available_scriptures = [record["name"] for record in s_result]
             a_result = session.run("MATCH (a:Author) RETURN a.name AS name LIMIT 100")
@@ -423,7 +433,7 @@ def get_perspectives_from_graph(user_query):
         print(f"Error fetching metadata: {e}")
         return [], {}
 
-    # 1. Comprehensive Extraction (includes Authors and Locations)
+    # 1. Prompt updated to include original language hints
     extraction_prompt = f"""
     Identify entities and search keywords in the user query.
     VALID SCRIPTURES: {available_scriptures}
@@ -437,8 +447,10 @@ def get_perspectives_from_graph(user_query):
       "authors": [],
       "locations": [],
       "topics": [], 
-      "search_keywords": ["specific names", "verbs", "unique objects"]
+      "search_keywords": ["names", "Sanskrit/Tamil terms", "objects", "concepts"]
     }}
+    
+    Note: If the query contains Indian names or terms, include them in the search_keywords.
     """
     
     response = client.chat.completions.create(
@@ -448,10 +460,10 @@ def get_perspectives_from_graph(user_query):
     )
     ents = json.loads(response.choices[0].message.content)
     
-    # 2. Build Search Params
-    # We use Lucene 'OR' syntax for the keywords
+    # 2. Build Search Params with Fuzzy matching (~2) for better 'text' field hits
     keywords = ents.get("search_keywords", [])
-    search_string = " OR ".join([f'"{k}"' for k in keywords if k])
+    # We add a small fuzzy factor (~) to help with transliteration variations in the text field
+    search_string = " OR ".join([f'"{k}"~2' for k in keywords if k])
 
     params = {
         "scriptures": ents.get("scriptures", []),
@@ -463,19 +475,18 @@ def get_perspectives_from_graph(user_query):
 
     # 3. Hybrid Cypher Query (Filters + Full Text Search)
     cypher_query = """
-    // Use Full-Text Index if keywords exist
+    // Now searching across v.text, v.translation, and v.word_by_word_native
     CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node AS v, score AS fts_score
     
-    // Connect to Metadata
     MATCH (v)-[:PART_OF]->(s:Scripture)
     OPTIONAL MATCH (v)-[:WRITTEN_BY]->(a:Author)
     OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
     
-    // Apply Hard Filters
+    // Apply Filters
     WHERE (size($scriptures) = 0 OR s.name IN $scriptures)
       AND (size($authors) = 0 OR a.name IN $authors)
     
-    // Calculate Multi-factor Score
+    // Multi-factor Scoring
     WITH v, s, a, t, fts_score
     WITH v, s, 
          sum(fts_score) AS base_score,
@@ -493,16 +504,16 @@ def get_perspectives_from_graph(user_query):
 
     context_data = []
     with driver.session() as session:
-        # Fallback to standard graph path if no keywords were identified
+        # Fallback logic if search_string is empty
         active_query = cypher_query if params["search_string"] else """
             MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
-            OPTIONAL MATCH (v)-[:WRITTEN_BY]->(a:Author)
             OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
             WHERE (size($topics) > 0 AND t.name IN $topics)
                OR (size($scriptures) > 0 AND s.name IN $scriptures)
             RETURN s.title AS scripture, v.relative_path AS verse_title, 
                    v.text AS verse_text, v.translation AS meaning, 
                    v.word_by_word_native AS wbw
+            ORDER BY size((v)-[:DISCUSSES]->()) DESC
             LIMIT 15
         """
         
