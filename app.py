@@ -44,7 +44,7 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
     # Query to get both the verses and the enrichment stats for this specific scripture
     query = """
     MATCH (s:Scripture {name: $internal_name})<-[:PART_OF]-(v:Verse)
-    WITH s, v ORDER BY v.global_index ASC
+    WITH s, v ORDER BY v.unit_index ASC
     
     // Calculate stats
     WITH s, collect(v) AS all_verses, count(v) AS total
