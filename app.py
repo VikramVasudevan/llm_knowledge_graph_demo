@@ -72,19 +72,20 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
     MATCH (s:Scripture {name: $internal_name})<-[:PART_OF]-(v:Verse)
     WITH s, v ORDER BY v.unit_index ASC
     
-    WITH s, collect({
+    // 1. Calculate stats and collect verses
+    WITH s, count(v) AS total, collect({
         relative_path: v.relative_path,
         text: v.text,
         translation: v.translation,
         wbw: v.word_by_word_native,
         topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name]
-    }) AS all_verses, count(v) AS total
+    }) AS all_verses
 
-    // 1. Calculate translation stats
+    // 2. Calculate translation stats
     OPTIONAL MATCH (v_t:Verse)-[:PART_OF]->(s) WHERE v_t.translation IS NOT NULL
     WITH s, all_verses, total, count(v_t) AS t_count
 
-    // 2. Calculate WBW stats - STRICT CHECK ADDED HERE
+    // 3. Calculate WBW stats with strict check
     OPTIONAL MATCH (v_w:Verse)-[:PART_OF]->(s) 
     WHERE v_w.word_by_word_native IS NOT NULL 
       AND v_w.word_by_word_native <> "" 
@@ -92,11 +93,12 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
       AND v_w.word_by_word_native <> []
     WITH s, all_verses, total, t_count, count(v_w) AS w_count
 
-    // 3. Calculate Topic stats
+    // 4. Calculate Topic stats
     OPTIONAL MATCH (v_top:Verse)-[:PART_OF]->(s) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
     WITH s, all_verses, total, t_count, w_count, count(DISTINCT v_top) AS top_count
 
-    RETURN all_verses, total, t_count, w_count, top_count
+    // SLICE the collection here to only return the first 1000 for the UI
+    RETURN all_verses[0..1000] AS limited_verses, total, t_count, w_count, top_count
     """
     try:
         with driver.session() as session:
@@ -105,7 +107,8 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
                 return "### No data", "", []
 
             total = record["total"] or 1
-            verses_data = record["all_verses"]
+            # We use the limited slice for the table details
+            verses_data = record["limited_verses"]
             
             p_trans = round((record["t_count"] * 1.0 / total) * 100, 1)
             p_wbw = round((record["w_count"] * 1.0 / total) * 100, 1)
@@ -119,17 +122,21 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
             details = []
             for v in verses_data:
                 topics_list = ", ".join(v["topics"]) if v["topics"] else "---"
-                wbw = format_wbw(v["wbw"])
-                # if not wbw: print(v["wbw"])
+                wbw_str = format_wbw(v["wbw"])
+                
                 details.append([
                     v["relative_path"],
                     v["text"],
                     v["translation"] or "No translation",
-                    wbw or "N/A",
+                    wbw_str or "N/A",
                     topics_list,
                 ])
             
-            header = f"### 📜 {scripture_title} ({total} Verses)"
+            # Update the header to indicate it's a partial view if total > 1000
+            display_count = len(details)
+            count_suffix = f" (Showing first {display_count})" if total > 1000 else ""
+            header = f"### 📜 {scripture_title} - {total} Total Verses{count_suffix}"
+            
             return header, stats_md, details
     except Exception as e:
         return f"⚠️ Error: {str(e)}", "", []
@@ -404,12 +411,10 @@ def format_wbw(wbw_data):
 
 
 # --- 3. Original Perspectives & Chat Logic ---
-
-
 def get_perspectives_from_graph(user_query):
-    # This is your original function exactly as sent
     try:
         with driver.session() as session:
+            # Pre-fetch valid metadata for the LLM to use
             s_result = session.run("MATCH (s:Scripture) RETURN s.name AS name")
             available_scriptures = [record["name"] for record in s_result]
             a_result = session.run("MATCH (a:Author) RETURN a.name AS name LIMIT 100")
@@ -418,80 +423,111 @@ def get_perspectives_from_graph(user_query):
         print(f"Error fetching metadata: {e}")
         return [], {}
 
+    # 1. Comprehensive Extraction (includes Authors and Locations)
     extraction_prompt = f"""
-    Identify entities in the user query.
+    Identify entities and search keywords in the user query.
     VALID SCRIPTURES: {available_scriptures}
     VALID AUTHORS: {available_authors}
+    
     Question: "{user_query}"
-    Return JSON: {{"scriptures": [], "locations": [], "topics": [], "authors": []}}
+    
+    Return JSON: 
+    {{
+      "scriptures": [], 
+      "authors": [],
+      "locations": [],
+      "topics": [], 
+      "search_keywords": ["specific names", "verbs", "unique objects"]
+    }}
     """
+    
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": extraction_prompt}],
         response_format={"type": "json_object"},
     )
     ents = json.loads(response.choices[0].message.content)
+    
+    # 2. Build Search Params
+    # We use Lucene 'OR' syntax for the keywords
+    keywords = ents.get("search_keywords", [])
+    search_string = " OR ".join([f'"{k}"' for k in keywords if k])
+
     params = {
         "scriptures": ents.get("scriptures", []),
         "authors": ents.get("authors", []),
         "topics": [t.strip().title() for t in ents.get("topics", [])],
         "locations": [l.strip().title() for l in ents.get("locations", [])],
+        "search_string": search_string
     }
 
+    # 3. Hybrid Cypher Query (Filters + Full Text Search)
     cypher_query = """
-    // 1. Find potential candidate verses first (Filter early)
-    MATCH (t:Topic)<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
-    WHERE (size($topics) = 0 OR t.name IN $topics)
-      AND (size($scriptures) = 0 OR s.name IN $scriptures)
+    // Use Full-Text Index if keywords exist
+    CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node AS v, score AS fts_score
     
-    // 2. Calculate scores for candidates only
+    // Connect to Metadata
+    MATCH (v)-[:PART_OF]->(s:Scripture)
+    OPTIONAL MATCH (v)-[:WRITTEN_BY]->(a:Author)
+    OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
+    
+    // Apply Hard Filters
+    WHERE (size($scriptures) = 0 OR s.name IN $scriptures)
+      AND (size($authors) = 0 OR a.name IN $authors)
+    
+    // Calculate Multi-factor Score
+    WITH v, s, a, t, fts_score
     WITH v, s, 
-         CASE WHEN t.name IN $topics THEN 200 ELSE 0 END as t_score
+         sum(fts_score) AS base_score,
+         sum(CASE WHEN t.name IN $topics THEN 150 ELSE 0 END) AS topic_boost,
+         sum(CASE WHEN a.name IN $authors THEN 100 ELSE 0 END) AS author_boost
+         
+    WITH v, s, (base_score + topic_boost + author_boost) AS final_score
+    ORDER BY final_score DESC
     
-    // 3. Group by Scripture and use collect/slice on a smaller set
-    WITH s, v, t_score
-    ORDER BY t_score DESC
-    
-    WITH s, collect({
-        verse_title: v.relative_path, 
-        verse_text: v.text, 
-        meaning: v.translation, 
-        wbw: v.word_by_word_native
-    })[0..2] as top_verses
-    
-    UNWIND top_verses as record
-    RETURN s.title AS scripture, record.verse_title AS verse_title, 
-           record.verse_text as verse_text, record.meaning AS meaning, 
-           record.wbw AS wbw
-    LIMIT 20
+    RETURN s.title AS scripture, v.relative_path AS verse_title, 
+           v.text AS verse_text, v.translation AS meaning, 
+           v.word_by_word_native AS wbw
+    LIMIT 15
     """
 
     context_data = []
     with driver.session() as session:
-        result = session.run(cypher_query, **params)
+        # Fallback to standard graph path if no keywords were identified
+        active_query = cypher_query if params["search_string"] else """
+            MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+            OPTIONAL MATCH (v)-[:WRITTEN_BY]->(a:Author)
+            OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
+            WHERE (size($topics) > 0 AND t.name IN $topics)
+               OR (size($scriptures) > 0 AND s.name IN $scriptures)
+            RETURN s.title AS scripture, v.relative_path AS verse_title, 
+                   v.text AS verse_text, v.translation AS meaning, 
+                   v.word_by_word_native AS wbw
+            LIMIT 15
+        """
+        
+        result = session.run(active_query, **params)
         for record in result:
             raw_meaning = record["meaning"] or ""
-            wbw_raw = record["wbw"]
-
-            # Use the helper!
-            formatted_wbw = format_wbw(wbw_raw)
+            formatted_wbw = format_wbw(record["wbw"])
             if formatted_wbw:
                 formatted_wbw = "\nWord-by-Word: " + formatted_wbw
 
-            context_data.append(
-                {
-                    "scripture": record["scripture"],
-                    "verse": record["verse_title"],
-                    "verse_text": record["verse_text"],
-                    "meaning": f"{raw_meaning}{formatted_wbw}",
-                }
-            )
+            context_data.append({
+                "scripture": record["scripture"],
+                "verse": record["verse_title"],
+                "verse_text": record["verse_text"],
+                "meaning": f"{raw_meaning}{formatted_wbw}",
+            })
+            
     return context_data, params
 
 
 def bhashyam_chat(message, history):
     try:
         context, identified_topics = get_perspectives_from_graph(message)
+        print("context:\n",context)
+        print("identified_topics:\n",identified_topics)
         if not context:
             yield "🔍 No matching verses found."
             return
