@@ -21,37 +21,78 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
+
 def get_all_scriptures_table():
-    """Fetches all scriptures and the count of verses in each."""
+    """Fetches scriptures with aggregated enrichment percentages using Cypher-native float conversion."""
     query = """
     MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)
-    RETURN s.title AS title, s.name AS internal_name, count(v) AS verse_count
-    ORDER BY s.title ASC
+    WITH s, count(v) AS total_verses
+    
+    // Count verses with translations
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_t:Verse) WHERE v_t.translation IS NOT NULL
+    WITH s, total_verses, count(v_t) AS t_count
+    
+    // Count verses with WBW
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_w:Verse) WHERE v_w.word_by_word_native IS NOT NULL 
+  AND v_w.word_by_word_native <> "" 
+  AND v_w.word_by_word_native <> "[]" 
+  AND v_w.word_by_word_native <> []
+    WITH s, total_verses, t_count, count(v_w) AS w_count
+    
+    // Count verses with at least one Topic
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_top:Verse) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
+    WITH s, total_verses, t_count, w_count, count(DISTINCT v_top) AS top_count
+    
+    // Calculate Percentages (Multiplying by 1.0 forces float division)
+    WITH s.title AS title, s.name AS internal_name, total_verses,
+         (t_count * 1.0 / total_verses) * 100 AS p_trans,
+         (w_count * 1.0 / total_verses) * 100 AS p_wbw,
+         (top_count * 1.0 / total_verses) * 100 AS p_topics
+         
+    // Average them for the final score
+    RETURN title, total_verses, internal_name, 
+           round((p_trans + p_wbw + p_topics) / 3.0, 1) AS overall_enrichment
+    ORDER BY overall_enrichment DESC, title ASC
     """
     try:
         with driver.session() as session:
             result = session.run(query)
-            # We return internal_name as well but might hide it in the UI or use it for lookups
-            return [[r["title"], r["verse_count"], r["internal_name"]] for r in result]
+            return [[r["title"], r["total_verses"], f"{r['overall_enrichment']}%", r["internal_name"]] 
+                    for r in result]
     except Exception as e:
-        return [[f"Error: {e}", 0, ""]]
+        return [[f"Error: {e}", 0, "0%", ""]]
+
 
 def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
     selected_row = scripture_data.iloc[evt.index[0]]
     scripture_title = selected_row["Scripture Title"]
     internal_name = selected_row["internal_id"]
 
-    # Query to get both the verses and the enrichment stats for this specific scripture
     query = """
     MATCH (s:Scripture {name: $internal_name})<-[:PART_OF]-(v:Verse)
     WITH s, v ORDER BY v.unit_index ASC
     
-    // Calculate stats
-    WITH s, collect(v) AS all_verses, count(v) AS total
+    WITH s, collect({
+        relative_path: v.relative_path,
+        text: v.text,
+        translation: v.translation,
+        wbw: v.word_by_word_native,
+        topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name]
+    }) AS all_verses, count(v) AS total
+
+    // 1. Calculate translation stats
     OPTIONAL MATCH (v_t:Verse)-[:PART_OF]->(s) WHERE v_t.translation IS NOT NULL
     WITH s, all_verses, total, count(v_t) AS t_count
-    OPTIONAL MATCH (v_w:Verse)-[:PART_OF]->(s) WHERE v_w.word_by_word_native IS NOT NULL
+
+    // 2. Calculate WBW stats - STRICT CHECK ADDED HERE
+    OPTIONAL MATCH (v_w:Verse)-[:PART_OF]->(s) 
+    WHERE v_w.word_by_word_native IS NOT NULL 
+      AND v_w.word_by_word_native <> "" 
+      AND v_w.word_by_word_native <> "[]" 
+      AND v_w.word_by_word_native <> []
     WITH s, all_verses, total, t_count, count(v_w) AS w_count
+
+    // 3. Calculate Topic stats
     OPTIONAL MATCH (v_top:Verse)-[:PART_OF]->(s) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
     WITH s, all_verses, total, t_count, w_count, count(DISTINCT v_top) AS top_count
 
@@ -64,34 +105,35 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
                 return "### No data", "", []
 
             total = record["total"] or 1
-            verses = record["all_verses"]
+            verses_data = record["all_verses"]
             
-            # Calculate percentages
-            p_trans = round((record["t_count"] / total) * 100, 1)
-            p_wbw = round((record["w_count"] / total) * 100, 1)
-            p_topics = round((record["top_count"] / total) * 100, 1)
+            p_trans = round((record["t_count"] * 1.0 / total) * 100, 1)
+            p_wbw = round((record["w_count"] * 1.0 / total) * 100, 1)
+            p_topics = round((record["top_count"] * 1.0 / total) * 100, 1)
 
-            # Format Stats Markdown
             stats_md = f"""
 | 🏷️ Topics Linked | 🔤 Word-by-Word | 🌐 Translation |
 |:---:|:---:|:---:|
 | **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |
 """
-            
             details = []
-            for v in verses:
+            for v in verses_data:
+                topics_list = ", ".join(v["topics"]) if v["topics"] else "---"
+                wbw = format_wbw(v["wbw"])
+                # if not wbw: print(v["wbw"])
                 details.append([
                     v["relative_path"],
                     v["text"],
                     v["translation"] or "No translation",
-                    format_wbw(v["word_by_word_native"]) or "N/A"
+                    wbw or "N/A",
+                    topics_list,
                 ])
             
             header = f"### 📜 {scripture_title} ({total} Verses)"
             return header, stats_md, details
-            
     except Exception as e:
         return f"⚠️ Error: {str(e)}", "", []
+
 
 def update_topic_everywhere(old_name, new_name):
     new_topics_list = [t.strip() for t in new_name.split(",") if t.strip()]
@@ -99,7 +141,7 @@ def update_topic_everywhere(old_name, new_name):
         return "⚠️ Error: New name cannot be empty."
 
     # Use absolute path or ensure this is the SAME db the server uses
-    SQLITE_PATH = "../bhashyamai_data_editor/llm_cache.db" 
+    SQLITE_PATH = "../bhashyamai_data_editor/llm_cache.db"
     conn = sqlite3.connect(SQLITE_PATH)
     cursor = conn.cursor()
 
@@ -111,9 +153,12 @@ def update_topic_everywhere(old_name, new_name):
             if old_name in topics:
                 updated = [t for t in topics if t != old_name]
                 for nt in new_topics_list:
-                    if nt not in updated: updated.append(nt)
-                cursor.execute("UPDATE keywords SET topics = ? WHERE hash = ?", 
-                               (json.dumps(updated, ensure_ascii=False), h))
+                    if nt not in updated:
+                        updated.append(nt)
+                cursor.execute(
+                    "UPDATE keywords SET topics = ? WHERE hash = ?",
+                    (json.dumps(updated, ensure_ascii=False), h),
+                )
 
         cursor.execute("SELECT hash, data FROM verse_enrichment")
         for h, data_json in cursor.fetchall():
@@ -122,16 +167,20 @@ def update_topic_everywhere(old_name, new_name):
                 existing = data["topics"]
                 updated = [t for t in existing if t != old_name]
                 for nt in new_topics_list:
-                    if nt not in updated: updated.append(nt)
+                    if nt not in updated:
+                        updated.append(nt)
                 data["topics"] = updated
-                cursor.execute("UPDATE verse_enrichment SET data = ? WHERE hash = ?", 
-                               (json.dumps(data, ensure_ascii=False), h))
+                cursor.execute(
+                    "UPDATE verse_enrichment SET data = ? WHERE hash = ?",
+                    (json.dumps(data, ensure_ascii=False), h),
+                )
         conn.commit()
 
         # 2. Update Neo4j (Graph Storage)
         # We use a DETACH DELETE on the old topic to ensure it's gone
         with driver.session() as session:
-            session.run("""
+            session.run(
+                """
                 MATCH (oldT:Topic {name: $old_name})
                 OPTIONAL MATCH (v:Verse)-[r:DISCUSSES]->(oldT)
                 WITH oldT, collect(v) as verses
@@ -145,13 +194,16 @@ def update_topic_everywhere(old_name, new_name):
                 
                 WITH oldT
                 DETACH DELETE oldT
-            """, {"old_name": old_name, "new_list": new_topics_list})
+            """,
+                {"old_name": old_name, "new_list": new_topics_list},
+            )
 
         return f"✅ Successfully split '{old_name}' into {new_topics_list}"
     except Exception as e:
         return f"⚠️ Update Error: {str(e)}"
     finally:
         conn.close()
+
 
 def get_top_10_topics():
     topics = get_all_topics_table()
@@ -168,7 +220,13 @@ def get_enrichment_stats():
     MATCH (v:Verse)
     WITH count(v) AS total
     CALL () { MATCH (v1:Verse) WHERE v1.translation IS NOT NULL RETURN count(v1) AS with_trans }
-    CALL () { MATCH (v2:Verse) WHERE v2.word_by_word_native IS NOT NULL RETURN count(v2) AS with_wbw }
+    CALL () { 
+        MATCH (v2:Verse) 
+        WHERE v2.word_by_word_native IS NOT NULL 
+          AND v2.word_by_word_native <> "" 
+          AND v2.word_by_word_native <> [] 
+        RETURN count(v2) AS with_wbw 
+    }
     CALL () { MATCH (v3:Verse)-[:DISCUSSES]->(:Topic) RETURN count(DISTINCT v3) AS with_topics }
     CALL () { MATCH (t:Topic) RETURN count(t) AS total_topics }
     CALL () { MATCH (ot:Topic) WHERE NOT (ot)<-[:DISCUSSES]-() RETURN count(ot) AS orphaned_topics }
@@ -256,7 +314,7 @@ def get_all_topics_table(search_query=""):
     WHERE NOT s.name IN $excluded_list
     RETURN t.name AS name, count(r) AS verse_count
     """
-    
+
     numbered_p = re.compile(r"^\d+\.\s*")
     bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
 
@@ -264,26 +322,29 @@ def get_all_topics_table(search_query=""):
         with driver.session() as session:
             result = session.run(query, excluded_list=excluded_scriptures)
             aggregated_topics = {}
-            TOPIC_TO_NODES_MAP = {} 
+            TOPIC_TO_NODES_MAP = {}
 
             for record in result:
                 raw_node_name = record["name"]
                 count = record["verse_count"]
-                if not raw_node_name: continue
+                if not raw_node_name:
+                    continue
 
                 # 1. Strip brackets/quotes and split by commas/newlines
                 clean_name = re.sub(r"[\[\]\"']", "", raw_node_name)
-                parts = re.split(r',|\n', clean_name)
+                parts = re.split(r",|\n", clean_name)
 
                 for p in parts:
                     t = p.strip()
-                    t = numbered_p.sub("", t) 
-                    t = bullet_p.sub("", t)   
+                    t = numbered_p.sub("", t)
+                    t = bullet_p.sub("", t)
                     display_name = t.strip("*:- ").title()
-                    
+
                     if display_name and len(display_name) > 1:
                         # 2. Aggregate counts
-                        aggregated_topics[display_name] = aggregated_topics.get(display_name, 0) + count
+                        aggregated_topics[display_name] = (
+                            aggregated_topics.get(display_name, 0) + count
+                        )
 
                         # 3. Map back to Raw Name
                         if display_name not in TOPIC_TO_NODES_MAP:
@@ -295,9 +356,11 @@ def get_all_topics_table(search_query=""):
             # aggregated_topics.items() returns (name, count) tuples.
             # We unpack them into a clean list of lists.
             all_topics = [[name, count] for name, count in aggregated_topics.items()]
-            
+
             if search_query:
-                all_topics = [t for t in all_topics if search_query.lower() in t[0].lower()]
+                all_topics = [
+                    t for t in all_topics if search_query.lower() in t[0].lower()
+                ]
 
             # Sort by Count DESC, then Name ASC
             all_topics.sort(key=lambda x: (-x[1], x[0]))
@@ -306,6 +369,7 @@ def get_all_topics_table(search_query=""):
 
     except Exception as e:
         return [[f"Error: {e}", 0]]
+
 
 def format_wbw(wbw_data):
     """Safely converts WBW data (list or JSON string) into a readable string."""
@@ -556,34 +620,41 @@ with gr.Blocks() as demo:
                 with gr.Column(scale=2):
                     gr.Markdown("### 📚 Browse by Scripture")
                     refresh_scripture_btn = gr.Button("🔄 Refresh List", size="sm")
-                    
+
                     scripture_table = gr.Dataframe(
-                        headers=["Scripture Title", "Verse Count", "internal_id"],
-                        datatype=["str", "number", "str"],
+                        headers=[
+                            "Scripture Title",
+                            "Verses",
+                            "Enrichment",
+                            "internal_id",
+                        ],
+                        datatype=["str", "number", "str", "str"],
                         value=get_all_scriptures_table(),
                         interactive=False,
                         show_search="search",
-                        # We hide the 3rd column (internal_id) from the user
-                        column_widths=["70%", "30%", "0%"], 
+                        column_widths=["55%", "15%", "30%", "0%"],
                     )
-                
+
                 with gr.Column(scale=4):
                     scripture_detail_header = gr.Markdown(
                         "### 📖 Scripture Content\n*Select a scripture on the left to view its verses in order.*"
                     )
-                    scripture_enrichment_stats = gr.Markdown("Select a scripture to see enrichment progress.")
+                    scripture_enrichment_stats = gr.Markdown(
+                        "Select a scripture to see enrichment progress."
+                    )
                     scripture_verse_table = gr.Dataframe(
                         headers=[
                             "Verse ID",
                             "Original Text",
                             "English Translation",
                             "Word-by-Word",
+                            "Topics",
                         ],
-                        datatype=["str", "str", "str", "str"],
+                        datatype=["str", "str", "str", "str", "str"],
                         wrap=True,
                         interactive=False,
                         show_search="search",
-                        column_widths=["15%", "25%", "30%", "30%"],
+                        column_widths=["10%", "20%", "25%", "25%", "20%"],
                     )
     # --- Event Bindings ---
 
@@ -596,21 +667,21 @@ with gr.Blocks() as demo:
     rename_btn.click(
         fn=update_topic_everywhere,
         inputs=[old_name_input, new_name_input],
-        outputs=rename_status
+        outputs=rename_status,
     ).then(
-        fn=lambda: get_all_topics_table(), # Refresh the table automatically
-        outputs=topics_table
+        fn=lambda: get_all_topics_table(),  # Refresh the table automatically
+        outputs=topics_table,
     )
 
     # 1. Update the helper to return all 4 necessary components
     def select_topic_for_rename(evt: gr.SelectData):
         # Get the clean topic name
         topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
-        
+
         # Call the existing verse fetcher logic
         header, details = get_verses_for_topic(evt)
-        
-        # Return: 
+
+        # Return:
         # 1. Topic name for 'old_name_input'
         # 2. Empty string for 'new_name_input' (to clear previous typing)
         # 3. Header markdown for 'detail_header'
@@ -618,11 +689,11 @@ with gr.Blocks() as demo:
         return topic_name, "", header, details
 
     # 2. Rebind the select event to the new helper
-    # Make sure to remove the old topics_table.select(fn=get_verses_for_topic...) 
+    # Make sure to remove the old topics_table.select(fn=get_verses_for_topic...)
     # and replace it with this:
     topics_table.select(
-        fn=select_topic_for_rename, 
-        outputs=[old_name_input, new_name_input, detail_header, verse_detail_table]
+        fn=select_topic_for_rename,
+        outputs=[old_name_input, new_name_input, detail_header, verse_detail_table],
     )
 
     # --- Chatbot Event Logic ---
@@ -663,23 +734,20 @@ with gr.Blocks() as demo:
         bot_action, chatbot, chatbot
     )
     # Refresh Scripture List
-    refresh_scripture_btn.click(
-        fn=get_all_scriptures_table, 
-        outputs=scripture_table
-    )
+    refresh_scripture_btn.click(fn=get_all_scriptures_table, outputs=scripture_table)
 
     # Scripture Table Selection Logic
     scripture_table.select(
         fn=get_verses_by_scripture,
         inputs=[scripture_table],
         outputs=[
-            scripture_detail_header, 
+            scripture_detail_header,
             scripture_enrichment_stats,
-            scripture_verse_table
-        ]
+            scripture_verse_table,
+        ],
     )
 
 if __name__ == "__main__":
     demo.queue().launch(
-        theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"), share=True
+        theme=gr.themes.Default(primary_hue="orange", secondary_hue="gray"), share=False
     )
