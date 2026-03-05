@@ -23,35 +23,34 @@ TOPIC_TO_NODES_MAP = {}
 
 
 def get_all_scriptures_table():
-    """Fetches scriptures with aggregated enrichment percentages using Cypher-native float conversion."""
+    """Fetches scriptures with aggregated enrichment percentages excluding empty text verses."""
     query = """
     MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)
+    WHERE v.text IS NOT NULL AND v.text <> ""
     WITH s, count(v) AS total_verses
     
-    // Count verses with translations
-    OPTIONAL MATCH (s)<-[:PART_OF]-(v_t:Verse) WHERE v_t.translation IS NOT NULL
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_t:Verse) 
+    WHERE v_t.text <> "" AND v_t.translation IS NOT NULL AND v_t.translation <> ""
     WITH s, total_verses, count(v_t) AS t_count
     
-    // Count verses with WBW
-    OPTIONAL MATCH (s)<-[:PART_OF]-(v_w:Verse) WHERE v_w.word_by_word_native IS NOT NULL 
-  AND v_w.word_by_word_native <> "" 
-  AND v_w.word_by_word_native <> "[]" 
-  AND v_w.word_by_word_native <> []
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_w:Verse) 
+    WHERE v_w.text <> "" AND v_w.word_by_word_native IS NOT NULL 
+      AND v_w.word_by_word_native <> "" 
+      AND v_w.word_by_word_native <> "[]" 
+      AND v_w.word_by_word_native <> []
     WITH s, total_verses, t_count, count(v_w) AS w_count
     
-    // Count verses with at least one Topic
-    OPTIONAL MATCH (s)<-[:PART_OF]-(v_top:Verse) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_top:Verse) 
+    WHERE v_top.text <> "" AND EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
     WITH s, total_verses, t_count, w_count, count(DISTINCT v_top) AS top_count
     
-    // Calculate Percentages (Multiplying by 1.0 forces float division)
     WITH s.title AS title, s.name AS internal_name, total_verses,
          (t_count * 1.0 / total_verses) * 100 AS p_trans,
          (w_count * 1.0 / total_verses) * 100 AS p_wbw,
          (top_count * 1.0 / total_verses) * 100 AS p_topics
          
-    // Average them for the final score
     RETURN title, total_verses, internal_name, 
-           round((p_trans + p_wbw + p_topics) / 3.0, 1) AS overall_enrichment
+           round((p_trans + p_wbw + p_topics) / 3.0, 4) AS overall_enrichment
     ORDER BY overall_enrichment DESC, title ASC
     """
     try:
@@ -62,8 +61,7 @@ def get_all_scriptures_table():
     except Exception as e:
         return [[f"Error: {e}", 0, "0%", ""]]
 
-
-def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
+def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
     selected_row = scripture_data.iloc[evt.index[0]]
     scripture_title = selected_row["Scripture Title"]
     internal_name = selected_row["internal_id"]
@@ -71,36 +69,47 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
     query = """
     MATCH (s:Scripture {name: $internal_name})
     
-    // 1. Calculate stats using COUNT alone with new Variable Scope Clause
+    // 1. Calculate stats excluding empty text
     CALL (s) {
         MATCH (s)<-[:PART_OF]-(v:Verse)
+        WHERE v.text IS NOT NULL AND v.text <> ""
         RETURN count(v) AS total
     }
     CALL (s) {
-        MATCH (s)<-[:PART_OF]-(v_t:Verse) WHERE v_t.translation IS NOT NULL
+        MATCH (s)<-[:PART_OF]-(v_t:Verse) 
+        WHERE v_t.text <> "" AND v_t.translation IS NOT NULL AND v_t.translation <> ""
         RETURN count(v_t) AS t_count
     }
     CALL (s) {
         MATCH (s)<-[:PART_OF]-(v_w:Verse) 
-        WHERE v_w.word_by_word_native IS NOT NULL 
+        WHERE v_w.text <> "" AND v_w.word_by_word_native IS NOT NULL 
           AND v_w.word_by_word_native <> "" 
           AND v_w.word_by_word_native <> "[]" 
           AND v_w.word_by_word_native <> []
         RETURN count(v_w) AS w_count
     }
     CALL (s) {
-        MATCH (s)<-[:PART_OF]-(v_top:Verse) WHERE EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
+        MATCH (s)<-[:PART_OF]-(v_top:Verse) 
+        WHERE v_top.text <> "" AND EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
         RETURN count(DISTINCT v_top) AS top_count
     }
 
-    // 2. Fetch ONLY the first 500 verses for display
-    WITH s, total, t_count, w_count, top_count
+    // 2. Fetch verses with text filter + UI toggle filter
     MATCH (s)<-[:PART_OF]-(v:Verse)
+    WHERE v.text IS NOT NULL AND v.text <> ""
+      AND ($filter_mode = "Show All" 
+           OR (
+               v.translation IS NULL 
+               OR v.translation = ""
+               OR v.word_by_word_native IS NULL 
+               OR v.word_by_word_native IN ["", "[]", []]
+               OR NOT EXISTS { (v)-[:DISCUSSES]->(:Topic) }
+           ))
+    
     WITH s, total, t_count, w_count, top_count, v
     ORDER BY v.unit_index ASC
     LIMIT 500
     
-    // 3. Collect detailed info for the limited set
     RETURN 
         total, t_count, w_count, top_count,
         collect({
@@ -108,46 +117,36 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data):
             text: v.text,
             translation: v.translation,
             wbw: v.word_by_word_native,
-            topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name]
+            topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name],
+            global_id: v.global_id
         }) AS limited_verses
     """
     try:
         with driver.session() as session:
-            record = session.run(query, internal_name=internal_name).single()
+            record = session.run(query, internal_name=internal_name, filter_mode=filter_mode).single()
             if not record:
                 return "### No data", "", []
 
             total = record["total"] or 1
-            # We use the limited slice for the table details
             verses_data = record["limited_verses"]
             
-            p_trans = round((record["t_count"] * 1.0 / total) * 100, 1)
-            p_wbw = round((record["w_count"] * 1.0 / total) * 100, 1)
-            p_topics = round((record["top_count"] * 1.0 / total) * 100, 1)
+            p_trans = round((record["t_count"] * 1.0 / total) * 100, 4)
+            p_wbw = round((record["w_count"] * 1.0 / total) * 100, 4)
+            p_topics = round((record["top_count"] * 1.0 / total) * 100, 4)
 
-            stats_md = f"""
-| 🏷️ Topics Linked | 🔤 Word-by-Word | 🌐 Translation |
-|:---:|:---:|:---:|
-| **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |
-"""
+            stats_md = f"| 🏷️ Topics Linked | 🔤 Word-by-Word | 🌐 Translation |\n|:---:|:---:|:---:|\n| **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |"
+            
             details = []
             for v in verses_data:
                 topics_list = ", ".join(v["topics"]) if v["topics"] else "---"
                 wbw_str = format_wbw(v["wbw"])
-                
                 details.append([
-                    v["relative_path"],
-                    v["text"],
-                    v["translation"] or "No translation",
-                    wbw_str or "N/A",
-                    topics_list,
+                    v["relative_path"], v["text"], v["translation"] or "No translation",
+                    wbw_str or "N/A", topics_list, v["global_id"]
                 ])
             
-            # Update the header to indicate it's a partial view if total > 1000
-            display_count = len(details)
-            count_suffix = f" (Showing first {display_count})" if total > 1000 else ""
-            header = f"### 📜 {scripture_title} - {total} Total Verses{count_suffix}"
-            
+            mode_label = " (Pending Enrichment)" if filter_mode != "Show All" else ""
+            header = f"### 📜 {scripture_title} - {total} Total Verses{mode_label}"
             return header, stats_md, details
     except Exception as e:
         return f"⚠️ Error: {str(e)}", "", []
@@ -235,17 +234,27 @@ def get_top_10_topics():
 
 def get_enrichment_stats():
     query = """
-    MATCH (v:Verse)
+    MATCH (v:Verse) WHERE v.text IS NOT NULL AND v.text <> ""
     WITH count(v) AS total
-    CALL () { MATCH (v1:Verse) WHERE v1.translation IS NOT NULL RETURN count(v1) AS with_trans }
     CALL () { 
-        MATCH (v2:Verse) 
-        WHERE v2.word_by_word_native IS NOT NULL 
+        MATCH (v1:Verse) 
+        WHERE v1.text <> "" AND v1.translation IS NOT NULL AND v1.translation <> "" 
+        RETURN count(v1) AS with_trans 
+    }
+    CALL () { 
+        MATCH (v2:Verse)  
+        WHERE v2.text <> "" 
+          AND v2.word_by_word_native IS NOT NULL 
           AND v2.word_by_word_native <> "" 
           AND v2.word_by_word_native <> [] 
+          AND v2.word_by_word_native <> "[]"
         RETURN count(v2) AS with_wbw 
     }
-    CALL () { MATCH (v3:Verse)-[:DISCUSSES]->(:Topic) RETURN count(DISTINCT v3) AS with_topics }
+    CALL () { 
+        MATCH (v3:Verse) 
+        WHERE v3.text <> "" AND EXISTS { (v3)-[:DISCUSSES]->(:Topic) }
+        RETURN count(DISTINCT v3) AS with_topics 
+    }
     CALL () { MATCH (t:Topic) RETURN count(t) AS total_topics }
     CALL () { MATCH (ot:Topic) WHERE NOT (ot)<-[:DISCUSSES]-() RETURN count(ot) AS orphaned_topics }
     RETURN total, with_trans, with_wbw, with_topics, total_topics, orphaned_topics
@@ -253,27 +262,22 @@ def get_enrichment_stats():
     try:
         with driver.session() as session:
             record = session.run(query).single()
-            if not record:
-                return "📊 Database empty."
+            if not record: return "📊 Database empty."
 
             total = record["total"] or 1
-            total_topics = record["total_topics"]
-            orphaned = record["orphaned_topics"]
-
             p_trans = round((record["with_trans"] / total) * 100, 2)
             p_topics = round((record["with_topics"] / total) * 100, 2)
 
             return f"""
-### 📊 Migration Progress
+### 📊 Migration Progress (Valid Verses Only)
 - **Total Verses:** {total:,}
 - **Enriched:** {p_trans}%
 - **Linked Topics:** {p_topics}%
 
 ### 🏷️ Topic Stats
-- **Total Topics:** {total_topics:,}
-- **Orphaned Topics:** {orphaned:,} 
-*(Topics with no verse links)*
-            """
+- **Total Topics:** {record['total_topics']:,}
+- **Orphaned Topics:** {record['orphaned_topics']:,} 
+"""
     except Exception as e:
         return f"⚠️ Stats Error: {str(e)}"
 
@@ -669,12 +673,7 @@ with gr.Blocks() as demo:
                     refresh_scripture_btn = gr.Button("🔄 Refresh List", size="sm")
 
                     scripture_table = gr.Dataframe(
-                        headers=[
-                            "Scripture Title",
-                            "Verses",
-                            "Enrichment",
-                            "internal_id",
-                        ],
+                        headers=["Scripture Title", "Verses", "Enrichment", "internal_id"],
                         datatype=["str", "number", "str", "str"],
                         value=get_all_scriptures_table(),
                         interactive=False,
@@ -683,25 +682,24 @@ with gr.Blocks() as demo:
                     )
 
                 with gr.Column(scale=4):
-                    scripture_detail_header = gr.Markdown(
-                        "### 📖 Scripture Content\n*Select a scripture on the left to view its verses in order.*"
+                    scripture_detail_header = gr.Markdown("### 📖 Scripture Content\n*Select a scripture on the left.*")
+                    
+                    # --- ADDED TOGGLE HERE ---
+                    view_mode_toggle = gr.Radio(
+                        choices=["Show All", "Pending Enrichment Only"],
+                        value="Show All",
+                        label="View Mode",
+                        info="Filter verses missing Topics, WBW, or Translation"
                     )
-                    scripture_enrichment_stats = gr.Markdown(
-                        "Select a scripture to see enrichment progress."
-                    )
+
+                    scripture_enrichment_stats = gr.Markdown("Select a scripture to see enrichment progress.")
                     scripture_verse_table = gr.Dataframe(
-                        headers=[
-                            "Verse ID",
-                            "Original Text",
-                            "English Translation",
-                            "Word-by-Word",
-                            "Topics",
-                        ],
-                        datatype=["str", "str", "str", "str", "str"],
+                        headers=["Verse ID", "Original Text", "English Translation", "Word-by-Word", "Topics", "Global Id"],
+                        datatype=["str", "str", "str", "str", "str", "str"],
                         wrap=True,
                         interactive=False,
                         show_search="search",
-                        column_widths=["10%", "20%", "25%", "25%", "20%"],
+                        column_widths=["10%", "20%", "25%", "25%", "15%", "5%"],
                     )
     # --- Event Bindings ---
 
@@ -786,7 +784,7 @@ with gr.Blocks() as demo:
     # Scripture Table Selection Logic
     scripture_table.select(
         fn=get_verses_by_scripture,
-        inputs=[scripture_table],
+        inputs=[scripture_table, view_mode_toggle], # Added toggle input
         outputs=[
             scripture_detail_header,
             scripture_enrichment_stats,
