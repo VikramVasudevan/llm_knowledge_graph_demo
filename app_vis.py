@@ -60,15 +60,11 @@ def get_color_for_type(type_name, color_cache):
 
 
 # --- Main Graph Generation ---
-
-
 def generate_graph(scripture_name, prabandham_name):
     if not scripture_name or not prabandham_name:
         return "<h3>Please select both a Scripture and a Prabandham.</h3>"
 
-    net = Network(
-        height="750px", width="100%", bgcolor=None, font_color="white", directed=True
-    )
+    net = Network(height="750px", width="100%", bgcolor=None, font_color="white", directed=True)
     net.barnes_hut(gravity=-3000, central_gravity=0.3, spring_length=150)
 
     color_cache = {}
@@ -76,18 +72,11 @@ def generate_graph(scripture_name, prabandham_name):
     query = """
     MATCH (s:Scripture {name: $s_name})
     MATCH (p:Chapter {name: $p_name, scripture: $s_name})
-    
-    // 1. Hierarchy: Use OPTIONAL so the Prabandham (p) shows up even if it has no children
     OPTIONAL MATCH path = (p)<-[:PART_OF*]-(sub:Chapter)
-    
-    // 2. Determine which node to look for verses on (either a sub-chapter or the Prabandham itself)
     WITH s, p, path, COALESCE(sub, p) as target_node
-    
-    // 3. Authors, Verses, and Locations
     OPTIONAL MATCH (target_node)<-[:IN_CHAPTER]-(v:Verse)
     OPTIONAL MATCH (a:Author)-[:CONTRIBUTED_TO]->(p)
     OPTIONAL MATCH (v)-[:LOCATED_AT]->(l:Location)
-    
     RETURN p, path, v, a, l
     """
 
@@ -97,101 +86,60 @@ def generate_graph(scripture_name, prabandham_name):
         added_edges = set()
 
         for record in results:
-            # 1. Always add the Prabandham node (p) first
             p_node = record["p"]
+            # 1. Root
             if p_node.element_id not in added_nodes:
-                net.add_node(
-                    p_node.element_id,
-                    label=f"Prabandham: {p_node.get('name')}",
-                    color=get_color_for_type("prabandham", color_cache),
-                    size=30,
-                    title="Root Level",
-                )
+                net.add_node(p_node.element_id, label=f"Prabandham: {p_node.get('name')}", 
+                             color=get_color_for_type("prabandham", color_cache), size=30)
                 added_nodes.add(p_node.element_id)
 
-            # 2. Process Hierarchy Path (if it exists)
+            # 2. Hierarchy Path
             path = record["path"]
             if path:
                 for node in path.nodes:
                     if node.element_id not in added_nodes:
                         node_type = node.get("type", "Chapter")
-                        net.add_node(
-                            node.element_id,
-                            label=f"{node_type}: {node.get('name')}",
-                            color=get_color_for_type(node_type, color_cache),
-                            size=25,
-                            title=node_type,
-                        )
+                        node_level = node.get("level", 1)
+                        # Hide anything below the first level
+                        net.add_node(node.element_id, label=f"{node_type}: {node.get('name')}", 
+                                     color=get_color_for_type(node_type, color_cache), 
+                                     hidden=(node_level > 1), size=20)
                         added_nodes.add(node.element_id)
                 for rel in path.relationships:
                     if rel.element_id not in added_edges:
-                        net.add_edge(
-                            rel.start_node.element_id,
-                            rel.end_node.element_id,
-                            color="#888888",
-                        )
+                        # Ensure edges are hidden if the child is hidden
+                        edge_hidden = (rel.start_node.get("level", 2) > 1)
+                        net.add_edge(rel.end_node.element_id, rel.start_node.element_id, 
+                                     color="#888888", hidden=edge_hidden)
                         added_edges.add(rel.element_id)
 
-            # ... (Rest of Author, Verse, and Location logic remains the same)
-
-            # 2. Authors (Yellow Stars)
-            if (a := record["a"]) and a.element_id not in added_nodes:
-                net.add_node(
-                    a.element_id,
-                    label=f"Author: {a.get('name')}",
-                    color=get_color_for_type("author", color_cache),
-                    shape="star",
-                    size=35,
-                )
-                added_nodes.add(a.element_id)
-                
-                # Link Author to Prabandham using the p_node directly
-                # This avoids the NoneType error on 'path'
-                net.add_edge(
-                    a.element_id,
-                    p_node.element_id,
-                    label="WROTE",
-                    color="#F1C40F",
-                )
-            # 3. Verses (Green Dots - Hidden by Default)
-            if (v := record["v"]) and v.element_id not in added_nodes:
-                net.add_node(
-                    v.element_id,
-                    label=v.get("title", "Verse"),
-                    color=get_color_for_type("verse", color_cache),
-                    shape="dot",
-                    size=10,
-                    hidden=True,
-                )
-                added_nodes.add(v.element_id)
-
-                # Link Verse to its Chapter
-                edge_res = session.run(
-                    """
-                    MATCH (v:Verse)-[r:IN_CHAPTER]->(c:Chapter) 
-                    WHERE elementId(v) = $vid RETURN elementId(c) as cid, elementId(r) as rid
-                """,
-                    vid=v.element_id,
-                ).single()
-                if edge_res and edge_res["rid"] not in added_edges:
-                    net.add_edge(
-                        v.element_id, edge_res["cid"], color="#44aa44", hidden=True
-                    )
-                    added_edges.add(edge_res["rid"])
-
-            # 4. Locations (Purple Triangles)
+            # 3. Locations (Purple Triangles)
             if (l := record["l"]) and l.element_id not in added_nodes:
-                net.add_node(
-                    l.element_id,
-                    label=f"Location: {l.get('name')}",
-                    color=get_color_for_type("location", color_cache),
-                    shape="triangle",
-                    size=20,
-                )
+                net.add_node(l.element_id, label=f"Location: {l.get('name')}", 
+                             color=get_color_for_type("location", color_cache), 
+                             shape="triangle", size=22, hidden=True)
                 added_nodes.add(l.element_id)
-                net.add_edge(
-                    v.element_id, l.element_id, label="MENTIONS", color="#9B59B6"
-                )
+                
+                # IMPORTANT: Link Location to Root Prabandham so it shows on first drill-down
+                net.add_edge(p_node.element_id, l.element_id, color="#333333", dashes=True, hidden=True)
+
+            # 4. Verses (Green Dots)
+            if (v := record["v"]) and v.element_id not in added_nodes:
+                net.add_node(v.element_id, label=v.get("title", "Verse"), 
+                             color=get_color_for_type("verse", color_cache), 
+                             shape="dot", size=10, hidden=True)
+                added_nodes.add(v.element_id)
+                
+                # FIND THE PARENT CHAPTER TO LINK DOWNWARD
+                # We need to link Chapter -> Verse so double-clicking the chapter reveals the verse
+                # Your DB has (v)-[:IN_CHAPTER]->(c), so we reverse the arrow for the UI
+                edge_res = session.run("MATCH (v:Verse)-[:IN_CHAPTER]->(c:Chapter) WHERE elementId(v) = $vid RETURN elementId(c) as cid", vid=v.element_id).single()
+                if edge_res:
+                    net.add_edge(edge_res["cid"], v.element_id, color="#44aa44", hidden=True)
+
+                # Link Verse -> Location
+                if l:
+                    net.add_edge(v.element_id, l.element_id, label="MENTIONS", color="#9B59B6", hidden=True)
 
     # Save and inject JS
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
@@ -255,7 +203,8 @@ def generate_graph(scripture_name, prabandham_name):
     network.on("doubleClick", function (params) {
         if (params.nodes.length > 0) {
             var nodeId = params.nodes[0];
-            var connectedNodes = network.getConnectedNodes(nodeId, 'from');
+            // 'to' finds all nodes that the clicked node points AT (its children)
+            var connectedNodes = network.getConnectedNodes(nodeId, 'to');
             var updateArray = [];
             
             connectedNodes.forEach(function(childId) {
@@ -270,6 +219,32 @@ def generate_graph(scripture_name, prabandham_name):
             });
             nodes.update(updateArray);
         }
+    });
+
+    // Filtering logic for Locations
+    network.on("selectNode", function (params) {
+        var selectedId = params.nodes[0];
+        var selectedNode = nodes.get(selectedId);
+        
+        if (selectedNode.shape === 'triangle') {
+            // 'from' finds verses that point TO this location
+            var relatedVerseIds = network.getConnectedNodes(selectedId, 'from');
+            
+            var allNodes = nodes.get().map(node => {
+                if (node.id === selectedId || relatedVerseIds.includes(node.id)) {
+                    return {id: node.id, opacity: 1, hidden: false};
+                } else {
+                    return {id: node.id, opacity: 0.1};
+                }
+            });
+            nodes.update(allNodes);
+        }
+    });
+
+    // Reset Filter on background click
+    network.on("deselectNode", function (params) {
+        var allNodes = nodes.get().map(node => ({id: node.id, opacity: 1}));
+        nodes.update(allNodes);
     });
 
     function expandAllNodes() {
