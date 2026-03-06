@@ -9,4 +9,5 @@ dependencies = [
     "neo4j>=6.1.0",
     "openai>=2.24.0",
     "python-dotenv>=1.2.1",
+    "pyvis>=0.3.2",
 ]
