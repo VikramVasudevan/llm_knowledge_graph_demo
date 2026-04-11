@@ -21,9 +21,69 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
+def get_all_characters_table(search_query=""):
+    """Fetches characters and their mention counts, excluding specific metadata scriptures."""
+    excluded_scriptures = ["yt_metadata"]
+
+    query = """
+    MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)-[r:MENTIONS]->(c:Character)
+    WHERE NOT s.name IN $excluded_list
+    RETURN c.name AS name, count(r) AS verse_count
+    ORDER BY verse_count DESC, name ASC
+    """
+
+    try:
+        with driver.session() as session:
+            result = session.run(query, excluded_list=excluded_scriptures)
+            # Standardizing to Title Case for display
+            all_chars = [[r["name"].title(), r["verse_count"]] for r in result]
+
+            if search_query:
+                all_chars = [
+                    c for c in all_chars if search_query.lower() in c[0].lower()
+                ]
+            return all_chars
+    except Exception as e:
+        return [[f"Error: {e}", 0]]
+
+def get_verses_for_character(evt: gr.SelectData):
+    """Fetches all verses linked to a selected character."""
+    character_name = evt.value if isinstance(evt.value, str) else evt.value[0]
+
+    query = """
+    MATCH (c:Character {name: $char_name})<-[:MENTIONS]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    RETURN s.title AS scripture, 
+           v.relative_path AS verse, 
+           v.text AS text, 
+           v.translation AS translation,
+           v.word_by_word_native AS wbw
+    ORDER BY s.title, v.relative_path
+    LIMIT 500
+    """
+
+    try:
+        with driver.session() as session:
+            result = session.run(query, char_name=character_name)
+            details = []
+            for r in result:
+                wbw_str = format_wbw(r["wbw"]) or "N/A"
+                details.append([
+                    r["scripture"],
+                    r["verse"],
+                    r["text"],
+                    r["translation"] or "No translation available",
+                    wbw_str,
+                ])
+
+            if not details:
+                return f"### No verses found for: {character_name}", []
+
+            return f"### 🎭 Verses mentioning: {character_name}", details
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}", []
 
 def get_all_scriptures_table():
-    """Fetches scriptures with aggregated enrichment percentages excluding empty text verses."""
+    """Fetches scriptures with aggregated enrichment percentages including empty text verses."""
     query = """
     MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)
     WHERE v.text IS NOT NULL AND v.text <> ""
@@ -43,14 +103,20 @@ def get_all_scriptures_table():
     OPTIONAL MATCH (s)<-[:PART_OF]-(v_top:Verse) 
     WHERE v_top.text <> "" AND EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
     WITH s, total_verses, t_count, w_count, count(DISTINCT v_top) AS top_count
+
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_c:Verse) 
+    WHERE v_c.text <> "" AND EXISTS { (v_c)-[:MENTIONS]->(:Character) }
+    WITH s, total_verses, t_count, w_count, top_count, count(DISTINCT v_c) AS char_count
     
-    WITH s.title AS title, s.name AS internal_name, total_verses,
+    // IMPORTANT: All variables must be carried into this WITH to be used in the RETURN
+    WITH s, total_verses, t_count, w_count, top_count, char_count,
          (t_count * 1.0 / total_verses) * 100 AS p_trans,
          (w_count * 1.0 / total_verses) * 100 AS p_wbw,
-         (top_count * 1.0 / total_verses) * 100 AS p_topics
+         (top_count * 1.0 / total_verses) * 100 AS p_topics,
+         (char_count * 1.0 / total_verses) * 100 AS p_chars
          
-    RETURN title, total_verses, internal_name, 
-           round((p_trans + p_wbw + p_topics) / 3.0, 4) AS overall_enrichment
+    RETURN s.title AS title, s.name AS internal_name, total_verses, 
+           round((p_trans + p_wbw + p_topics + p_chars) / 4.0, 4) AS overall_enrichment
     ORDER BY overall_enrichment DESC, title ASC
     """
     try:
@@ -59,6 +125,7 @@ def get_all_scriptures_table():
             return [[r["title"], r["total_verses"], f"{r['overall_enrichment']}%", r["internal_name"]] 
                     for r in result]
     except Exception as e:
+        print(f"Neo4j Error: {e}")
         return [[f"Error: {e}", 0, "0%", ""]]
 
 def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
@@ -93,6 +160,12 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
         WHERE v_top.text <> "" AND EXISTS { (v_top)-[:DISCUSSES]->(:Topic) }
         RETURN count(DISTINCT v_top) AS top_count
     }
+    // ADDED: Character count call
+    CALL (s) {
+        MATCH (s)<-[:PART_OF]-(v_char:Verse) 
+        WHERE v_char.text <> "" AND EXISTS { (v_char)-[:MENTIONS]->(:Character) }
+        RETURN count(DISTINCT v_char) AS char_count
+    }
 
     // 2. Fetch verses with text filter + UI toggle filter
     MATCH (s)<-[:PART_OF]-(v:Verse)
@@ -104,20 +177,23 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
                OR v.word_by_word_native IS NULL 
                OR v.word_by_word_native IN ["", "[]", []]
                OR NOT EXISTS { (v)-[:DISCUSSES]->(:Topic) }
-           ))
+               OR NOT EXISTS { (v)-[:MENTIONS]->(:Character) } // Also filter by missing characters
+            ))
     
-    WITH s, total, t_count, w_count, top_count, v
+    WITH s, total, t_count, w_count, top_count, char_count, v
     ORDER BY v.unit_index ASC
     LIMIT 500
     
+    
     RETURN 
-        total, t_count, w_count, top_count,
+        total, t_count, w_count, top_count, char_count,
         collect({
             relative_path: v.relative_path,
             text: v.text,
             translation: v.translation,
             wbw: v.word_by_word_native,
             topics: [(v)-[:DISCUSSES]->(t:Topic) | t.name],
+            characters: [(v)-[:MENTIONS]->(c:Character) | c.name], // Crucial for the list
             global_id: v.global_id
         }) AS limited_verses
     """
@@ -133,16 +209,30 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
             p_trans = round((record["t_count"] * 1.0 / total) * 100, 4)
             p_wbw = round((record["w_count"] * 1.0 / total) * 100, 4)
             p_topics = round((record["top_count"] * 1.0 / total) * 100, 4)
+            p_chars = round((record["char_count"] * 1.0 / total) * 100, 4) # New Stat
 
-            stats_md = f"| 🏷️ Topics Linked | 🔤 Word-by-Word | 🌐 Translation |\n|:---:|:---:|:---:|\n| **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |"
+            # Updated Markdown Table with 4 columns
+            stats_md = (
+                f"| 🎭 Characters | 🏷️ Topics | 🔤 Word-by-Word | 🌐 Translation |\n"
+                f"|:---:|:---:|:---:|:---:|\n"
+                f"| **{p_chars}%** | **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |"
+            )
             
             details = []
             for v in verses_data:
                 topics_list = ", ".join(v["topics"]) if v["topics"] else "---"
+                chars_list = ", ".join(v["characters"]) if v["characters"] else "---"
                 wbw_str = format_wbw(v["wbw"])
+                
+                # Updated to match 7 columns now
                 details.append([
-                    v["relative_path"], v["text"], v["translation"] or "No translation",
-                    wbw_str or "N/A", topics_list, v["global_id"]
+                    v["relative_path"], 
+                    v["text"], 
+                    v["translation"] or "No translation",
+                    wbw_str or "N/A", 
+                    topics_list,      # Topic column
+                    chars_list,       # Character column
+                    v["global_id"]
                 ])
             
             mode_label = " (Pending Enrichment)" if filter_mode != "Show All" else ""
@@ -449,12 +539,11 @@ def get_perspectives_from_graph(user_query):
     {{
       "scriptures": [], 
       "authors": [],
+      "characters": [], 
       "locations": [],
       "topics": [], 
       "search_keywords": ["names", "Sanskrit/Tamil terms", "objects", "concepts"]
     }}
-    
-    Note: If the query contains Indian names or terms, include them in the search_keywords.
     """
     
     response = client.chat.completions.create(
@@ -473,31 +562,37 @@ def get_perspectives_from_graph(user_query):
         "scriptures": ents.get("scriptures", []),
         "authors": ents.get("authors", []),
         "topics": [t.strip().title() for t in ents.get("topics", [])],
+        "characters": [c.strip().title() for c in ents.get("characters", [])], # ADD THIS
         "locations": [l.strip().title() for l in ents.get("locations", [])],
         "search_string": search_string
     }
-
     # 3. Hybrid Cypher Query (Filters + Full Text Search)
     cypher_query = """
-    // Now searching across v.text, v.translation, and v.word_by_word_native
+    // 1. First, find verses that have a DIRECT RELATIONSHIP to the identified characters
+    OPTIONAL MATCH (v_rel:Verse)-[:MENTIONS]->(c:Character)
+    WHERE toLower(c.name) IN [x IN $characters | toLower(x)]
+    WITH collect(v_rel) AS related_verses
+    
+    // 2. Perform the standard Keyword Search
     CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node AS v, score AS fts_score
     
     MATCH (v)-[:PART_OF]->(s:Scripture)
-    OPTIONAL MATCH (v)-[:WRITTEN_BY]->(a:Author)
+    OPTIONAL MATCH (a:Author)-[:AUTHORED]->(v)
     OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
+    OPTIONAL MATCH (v)-[:MENTIONS]->(char:Character)
     
-    // Apply Filters
     WHERE (size($scriptures) = 0 OR s.name IN $scriptures)
       AND (size($authors) = 0 OR a.name IN $authors)
     
-    // Multi-factor Scoring
-    WITH v, s, a, t, fts_score
+    WITH v, s, a, t, char, fts_score, related_verses
+    
+    // 3. Scoring Logic: Give a massive priority to the verses found in Step 1
     WITH v, s, 
          sum(fts_score) AS base_score,
-         sum(CASE WHEN t.name IN $topics THEN 150 ELSE 0 END) AS topic_boost,
-         sum(CASE WHEN a.name IN $authors THEN 100 ELSE 0 END) AS author_boost
+         (CASE WHEN v IN related_verses THEN 5000 ELSE 0 END) AS rel_boost,
+         sum(CASE WHEN toLower(t.name) IN [x IN $topics | toLower(x)] THEN 150 ELSE 0 END) AS topic_boost
          
-    WITH v, s, (base_score + topic_boost + author_boost) AS final_score
+    WITH v, s, (base_score + rel_boost + topic_boost) AS final_score
     ORDER BY final_score DESC
     
     RETURN s.title AS scripture, v.relative_path AS verse_title, 
@@ -665,6 +760,39 @@ with gr.Blocks() as demo:
                         column_widths=["10%", "10%", "25%", "25%", "30%"],
                     )
 
+        # --- Tab 2.5: Character Index ---
+        with gr.Tab("🎭 Character Index"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 🔍 Search Characters")
+                    refresh_chars_btn = gr.Button("🔄 Refresh Character List", size="sm")
+                    
+                    chars_table = gr.Dataframe(
+                        headers=["Character Name", "Mentions"],
+                        datatype=["str", "number"],
+                        value=get_all_characters_table(),
+                        interactive=False,
+                        show_search="search",
+                        column_widths=[200, 80],
+                    )
+                with gr.Column(scale=4):
+                    char_detail_header = gr.Markdown(
+                        "### 📖 Character Details\n*Select a character on the left to view verses.*"
+                    )
+                    char_verse_table = gr.Dataframe(
+                        headers=[
+                            "Scripture",
+                            "Verse ID",
+                            "Original Text",
+                            "English Translation",
+                            "Word-by-Word",
+                        ],
+                        datatype=["str", "str", "str", "str", "str"],
+                        wrap=True,
+                        interactive=False,
+                        column_widths=["10%", "10%", "25%", "25%", "30%"],
+                    )                    
+
         # --- Tab 3: Scripture Index ---
         with gr.Tab("📜 Scripture Index"):
             with gr.Row():
@@ -694,12 +822,21 @@ with gr.Blocks() as demo:
 
                     scripture_enrichment_stats = gr.Markdown("Select a scripture to see enrichment progress.")
                     scripture_verse_table = gr.Dataframe(
-                        headers=["Verse ID", "Original Text", "English Translation", "Word-by-Word", "Topics", "Global Id"],
-                        datatype=["str", "str", "str", "str", "str", "str"],
+                        headers=[
+                            "Verse ID", 
+                            "Original Text", 
+                            "English Translation", 
+                            "Word-by-Word", 
+                            "Topics", 
+                            "Characters", # Added Header
+                            "Global Id"
+                        ],
+                        datatype=["str", "str", "str", "str", "str", "str", "str"], # Added str for Character
                         wrap=True,
                         interactive=False,
                         show_search="search",
-                        column_widths=["10%", "20%", "25%", "25%", "15%", "5%"],
+                        # Balanced widths: ID(10), Text(15), Trans(20), WBW(20), Topics(15), Chars(15), Global(5)
+                        column_widths=["10%", "15%", "20%", "20%", "15%", "15%", "5%"],
                     )
     # --- Event Bindings ---
 
@@ -791,6 +928,15 @@ with gr.Blocks() as demo:
             scripture_verse_table,
         ],
     )
+
+    # Refresh Character Table
+    refresh_chars_btn.click(fn=lambda: get_all_characters_table(), outputs=chars_table)
+
+    # Character Table Selection Logic
+    chars_table.select(
+        fn=get_verses_for_character,
+        outputs=[char_detail_header, char_verse_table],
+    )    
 
 if __name__ == "__main__":
     demo.queue().launch(
