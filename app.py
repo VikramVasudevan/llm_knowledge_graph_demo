@@ -21,6 +21,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 # Global cache to keep the UI in sync with the Database
 TOPIC_TO_NODES_MAP = {}
 
+
 def get_all_characters_table(search_query=""):
     """Fetches characters and their mention counts, excluding specific metadata scriptures."""
     excluded_scriptures = ["yt_metadata"]
@@ -46,6 +47,7 @@ def get_all_characters_table(search_query=""):
     except Exception as e:
         return [[f"Error: {e}", 0]]
 
+
 def get_verses_for_character(evt: gr.SelectData):
     """Fetches all verses linked to a selected character."""
     character_name = evt.value if isinstance(evt.value, str) else evt.value[0]
@@ -67,13 +69,15 @@ def get_verses_for_character(evt: gr.SelectData):
             details = []
             for r in result:
                 wbw_str = format_wbw(r["wbw"]) or "N/A"
-                details.append([
-                    r["scripture"],
-                    r["verse"],
-                    r["text"],
-                    r["translation"] or "No translation available",
-                    wbw_str,
-                ])
+                details.append(
+                    [
+                        r["scripture"],
+                        r["verse"],
+                        r["text"],
+                        r["translation"] or "No translation available",
+                        wbw_str,
+                    ]
+                )
 
             if not details:
                 return f"### No verses found for: {character_name}", []
@@ -81,6 +85,7 @@ def get_verses_for_character(evt: gr.SelectData):
             return f"### 🎭 Verses mentioning: {character_name}", details
     except Exception as e:
         return f"⚠️ Error: {str(e)}", []
+
 
 def get_all_scriptures_table():
     """Fetches scriptures with aggregated enrichment percentages including empty text verses."""
@@ -122,11 +127,19 @@ def get_all_scriptures_table():
     try:
         with driver.session() as session:
             result = session.run(query)
-            return [[r["title"], r["total_verses"], f"{r['overall_enrichment']}%", r["internal_name"]] 
-                    for r in result]
+            return [
+                [
+                    r["title"],
+                    r["total_verses"],
+                    f"{r['overall_enrichment']}%",
+                    r["internal_name"],
+                ]
+                for r in result
+            ]
     except Exception as e:
         print(f"Neo4j Error: {e}")
         return [[f"Error: {e}", 0, "0%", ""]]
+
 
 def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
     selected_row = scripture_data.iloc[evt.index[0]]
@@ -199,17 +212,19 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
     """
     try:
         with driver.session() as session:
-            record = session.run(query, internal_name=internal_name, filter_mode=filter_mode).single()
+            record = session.run(
+                query, internal_name=internal_name, filter_mode=filter_mode
+            ).single()
             if not record:
                 return "### No data", "", []
 
             total = record["total"] or 1
             verses_data = record["limited_verses"]
-            
+
             p_trans = round((record["t_count"] * 1.0 / total) * 100, 4)
             p_wbw = round((record["w_count"] * 1.0 / total) * 100, 4)
             p_topics = round((record["top_count"] * 1.0 / total) * 100, 4)
-            p_chars = round((record["char_count"] * 1.0 / total) * 100, 4) # New Stat
+            p_chars = round((record["char_count"] * 1.0 / total) * 100, 4)  # New Stat
 
             # Updated Markdown Table with 4 columns
             stats_md = (
@@ -217,24 +232,26 @@ def get_verses_by_scripture(evt: gr.SelectData, scripture_data, filter_mode):
                 f"|:---:|:---:|:---:|:---:|\n"
                 f"| **{p_chars}%** | **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |"
             )
-            
+
             details = []
             for v in verses_data:
                 topics_list = ", ".join(v["topics"]) if v["topics"] else "---"
                 chars_list = ", ".join(v["characters"]) if v["characters"] else "---"
                 wbw_str = format_wbw(v["wbw"])
-                
+
                 # Updated to match 7 columns now
-                details.append([
-                    v["relative_path"], 
-                    v["text"], 
-                    v["translation"] or "No translation",
-                    wbw_str or "N/A", 
-                    topics_list,      # Topic column
-                    chars_list,       # Character column
-                    v["global_id"]
-                ])
-            
+                details.append(
+                    [
+                        v["relative_path"],
+                        v["text"],
+                        v["translation"] or "No translation",
+                        wbw_str or "N/A",
+                        topics_list,  # Topic column
+                        chars_list,  # Character column
+                        v["global_id"],
+                    ]
+                )
+
             mode_label = " (Pending Enrichment)" if filter_mode != "Show All" else ""
             header = f"### 📜 {scripture_title} - {total} Total Verses{mode_label}"
             return header, stats_md, details
@@ -352,7 +369,8 @@ def get_enrichment_stats():
     try:
         with driver.session() as session:
             record = session.run(query).single()
-            if not record: return "📊 Database empty."
+            if not record:
+                return "📊 Database empty."
 
             total = record["total"] or 1
             p_trans = round((record["with_trans"] / total) * 100, 2)
@@ -516,7 +534,7 @@ def format_wbw(wbw_data):
 
 
 # --- 3. Original Perspectives & Chat Logic ---
-def get_perspectives_from_graph(user_query):
+def get_perspectives_from_graph(user_query, use_fts=True):
     try:
         with driver.session() as session:
             s_result = session.run("MATCH (s:Scripture) RETURN s.name AS name")
@@ -545,55 +563,86 @@ def get_perspectives_from_graph(user_query):
       "search_keywords": ["names", "Sanskrit/Tamil terms", "objects", "concepts"]
     }}
     """
-    
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": extraction_prompt}],
         response_format={"type": "json_object"},
     )
     ents = json.loads(response.choices[0].message.content)
-    
-    # 2. Build Search Params with Fuzzy matching (~2) for better 'text' field hits
+
+    # 2. Build Search Params
     keywords = ents.get("search_keywords", [])
-    # We add a small fuzzy factor (~) to help with transliteration variations in the text field
     search_string = " OR ".join([f'"{k}"~2' for k in keywords if k])
 
     params = {
         "scriptures": ents.get("scriptures", []),
         "authors": ents.get("authors", []),
         "topics": [t.strip().title() for t in ents.get("topics", [])],
-        "characters": [c.strip().title() for c in ents.get("characters", [])], # ADD THIS
-        "locations": [l.strip().title() for l in ents.get("locations", [])],
-        "search_string": search_string
+        "characters": [c.strip().title() for c in ents.get("characters", [])],
+        "search_string": search_string,
+        "use_fts": use_fts,  # Pass this to Cypher
     }
-    # 3. Hybrid Cypher Query (Filters + Full Text Search)
+
+    # 3. Updated Cypher Query with Toggle Support
     cypher_query = """
-    // 1. First, find verses that have a DIRECT RELATIONSHIP to the identified characters
-    OPTIONAL MATCH (v_rel:Verse)-[:MENTIONS]->(c:Character)
+    // 1. Identify Graph matches
+    OPTIONAL MATCH (v_char:Verse)-[:MENTIONS]->(c:Character)
     WHERE toLower(c.name) IN [x IN $characters | toLower(x)]
-    WITH collect(v_rel) AS related_verses
+    WITH collect(DISTINCT v_char) AS char_verses
     
-    // 2. Perform the standard Keyword Search
-    CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node AS v, score AS fts_score
-    
-    MATCH (v)-[:PART_OF]->(s:Scripture)
+    OPTIONAL MATCH (v_top:Verse)-[:DISCUSSES]->(t:Topic)
+    WHERE toLower(t.name) IN [x IN $topics | toLower(x)]
+    WITH char_verses, collect(DISTINCT v_top) AS top_verses
+
+    // 2. Fetch FTS nodes (always fetch, we filter the score later)
+    OPTIONAL MATCH (v_fts:Verse)
+    WHERE $use_fts = true
+    CALL {
+        WITH v_fts
+        CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node, score
+        WHERE node = v_fts
+        RETURN score as fts_score
+    }
+
+    // 3. Combine and Filter
+    // We get all verses that are either in our Graph sets OR found via FTS
+    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+    WHERE v IN char_verses 
+       OR v IN top_verses 
+       OR ($use_fts = true AND EXISTS { 
+           CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node 
+           WHERE node = v 
+           RETURN node 
+       })
+
+    // 4. Author Filter
     OPTIONAL MATCH (a:Author)-[:AUTHORED]->(v)
-    OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
-    OPTIONAL MATCH (v)-[:MENTIONS]->(char:Character)
-    
     WHERE (size($scriptures) = 0 OR s.name IN $scriptures)
       AND (size($authors) = 0 OR a.name IN $authors)
+
+    WITH v, s, char_verses, top_verses
     
-    WITH v, s, a, t, char, fts_score, related_verses
+    // 5. Calculate Final Score
+    // Re-calculating FTS score only if enabled
+    CALL {
+        WITH v
+        CALL db.index.fulltext.queryNodes("verseTextIndex", $search_string) YIELD node, score
+        WHERE node = v
+        RETURN score
+        UNION
+        RETURN 0.0 AS score
+    }
     
-    // 3. Scoring Logic: Give a massive priority to the verses found in Step 1
-    WITH v, s, 
-         sum(fts_score) AS base_score,
-         (CASE WHEN v IN related_verses THEN 5000 ELSE 0 END) AS rel_boost,
-         sum(CASE WHEN toLower(t.name) IN [x IN $topics | toLower(x)] THEN 150 ELSE 0 END) AS topic_boost
+    WITH v, s, max(score) as final_fts_score, char_verses, top_verses
+    WITH v, s,
+         (CASE WHEN $use_fts = true THEN final_fts_score ELSE 0 END) AS base_score,
+         (CASE WHEN v IN char_verses THEN 5000 ELSE 0 END) AS char_boost,
+         (CASE WHEN v IN top_verses THEN 1000 ELSE 0 END) AS topic_boost
          
-    WITH v, s, (base_score + rel_boost + topic_boost) AS final_score
-    ORDER BY final_score DESC
+    WITH v, s, (base_score + char_boost + topic_boost) AS total_score
+    WHERE total_score > 0
+    ORDER BY total_score DESC
     
     RETURN s.title AS scripture, v.relative_path AS verse_title, 
            v.text AS verse_text, v.translation AS meaning, 
@@ -604,7 +653,10 @@ def get_perspectives_from_graph(user_query):
     context_data = []
     with driver.session() as session:
         # Fallback logic if search_string is empty
-        active_query = cypher_query if params["search_string"] else """
+        active_query = (
+            cypher_query
+            if params["search_string"]
+            else """
             MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
             OPTIONAL MATCH (v)-[:DISCUSSES]->(t:Topic)
             WHERE (size($topics) > 0 AND t.name IN $topics)
@@ -615,7 +667,8 @@ def get_perspectives_from_graph(user_query):
             ORDER BY size((v)-[:DISCUSSES]->()) DESC
             LIMIT 15
         """
-        
+        )
+
         result = session.run(active_query, **params)
         for record in result:
             raw_meaning = record["meaning"] or ""
@@ -623,21 +676,23 @@ def get_perspectives_from_graph(user_query):
             if formatted_wbw:
                 formatted_wbw = "\nWord-by-Word: " + formatted_wbw
 
-            context_data.append({
-                "scripture": record["scripture"],
-                "verse": record["verse_title"],
-                "verse_text": record["verse_text"],
-                "meaning": f"{raw_meaning}{formatted_wbw}",
-            })
-            
+            context_data.append(
+                {
+                    "scripture": record["scripture"],
+                    "verse": record["verse_title"],
+                    "verse_text": record["verse_text"],
+                    "meaning": f"{raw_meaning}{formatted_wbw}",
+                }
+            )
+
     return context_data, params
 
 
-def bhashyam_chat(message, history):
+def bhashyam_chat(message, history, use_fts):
     try:
-        context, identified_topics = get_perspectives_from_graph(message)
-        print("context:\n",context)
-        print("identified_topics:\n",identified_topics)
+        context, identified_topics = get_perspectives_from_graph(message, use_fts)
+        print("context:\n", context)
+        print("identified_topics:\n", identified_topics)
         if not context:
             yield "🔍 No matching verses found."
             return
@@ -708,6 +763,12 @@ with gr.Blocks() as demo:
                         submit_btn = gr.Button("Send", variant="primary", scale=1)
 
                 with gr.Column(scale=1, variant="panel"):
+                    gr.Markdown("### 🛠️ Search Settings")
+                    fts_toggle = gr.Checkbox(
+                        label="Enable Full-Text Search",
+                        value=True,
+                        info="Disable to test pure Graph lookups.",
+                    )
                     stats_sidebar = gr.Markdown(get_enrichment_stats())
                     refresh_stats_btn = gr.Button("🔄 Refresh All Stats")
 
@@ -765,8 +826,10 @@ with gr.Blocks() as demo:
             with gr.Row():
                 with gr.Column(scale=2):
                     gr.Markdown("### 🔍 Search Characters")
-                    refresh_chars_btn = gr.Button("🔄 Refresh Character List", size="sm")
-                    
+                    refresh_chars_btn = gr.Button(
+                        "🔄 Refresh Character List", size="sm"
+                    )
+
                     chars_table = gr.Dataframe(
                         headers=["Character Name", "Mentions"],
                         datatype=["str", "number"],
@@ -791,7 +854,7 @@ with gr.Blocks() as demo:
                         wrap=True,
                         interactive=False,
                         column_widths=["10%", "10%", "25%", "25%", "30%"],
-                    )                    
+                    )
 
         # --- Tab 3: Scripture Index ---
         with gr.Tab("📜 Scripture Index"):
@@ -801,7 +864,12 @@ with gr.Blocks() as demo:
                     refresh_scripture_btn = gr.Button("🔄 Refresh List", size="sm")
 
                     scripture_table = gr.Dataframe(
-                        headers=["Scripture Title", "Verses", "Enrichment", "internal_id"],
+                        headers=[
+                            "Scripture Title",
+                            "Verses",
+                            "Enrichment",
+                            "internal_id",
+                        ],
                         datatype=["str", "number", "str", "str"],
                         value=get_all_scriptures_table(),
                         interactive=False,
@@ -810,28 +878,40 @@ with gr.Blocks() as demo:
                     )
 
                 with gr.Column(scale=4):
-                    scripture_detail_header = gr.Markdown("### 📖 Scripture Content\n*Select a scripture on the left.*")
-                    
+                    scripture_detail_header = gr.Markdown(
+                        "### 📖 Scripture Content\n*Select a scripture on the left.*"
+                    )
+
                     # --- ADDED TOGGLE HERE ---
                     view_mode_toggle = gr.Radio(
                         choices=["Show All", "Pending Enrichment Only"],
                         value="Show All",
                         label="View Mode",
-                        info="Filter verses missing Topics, WBW, or Translation"
+                        info="Filter verses missing Topics, WBW, or Translation",
                     )
 
-                    scripture_enrichment_stats = gr.Markdown("Select a scripture to see enrichment progress.")
+                    scripture_enrichment_stats = gr.Markdown(
+                        "Select a scripture to see enrichment progress."
+                    )
                     scripture_verse_table = gr.Dataframe(
                         headers=[
-                            "Verse ID", 
-                            "Original Text", 
-                            "English Translation", 
-                            "Word-by-Word", 
-                            "Topics", 
-                            "Characters", # Added Header
-                            "Global Id"
+                            "Verse ID",
+                            "Original Text",
+                            "English Translation",
+                            "Word-by-Word",
+                            "Topics",
+                            "Characters",  # Added Header
+                            "Global Id",
                         ],
-                        datatype=["str", "str", "str", "str", "str", "str", "str"], # Added str for Character
+                        datatype=[
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                        ],  # Added str for Character
                         wrap=True,
                         interactive=False,
                         show_search="search",
@@ -883,13 +963,10 @@ with gr.Blocks() as demo:
         # New format: list of dicts
         return "", history + [{"role": "user", "content": user_message}]
 
-    def bot_action(history):
+    def bot_action(history, use_fts):
         user_message = history[-1]["content"]
-        bot_response = bhashyam_chat(user_message, history)
-
-        # Initialize the assistant message
+        bot_response = bhashyam_chat(user_message, history, use_fts)
         history.append({"role": "assistant", "content": ""})
-
         for chunk in bot_response:
             history[-1]["content"] = chunk
             yield history
@@ -907,13 +984,13 @@ with gr.Blocks() as demo:
 
     # Bind the 'Send' button and 'Enter' key
     submit_btn.click(user_action, [msg, chatbot], [msg, chatbot]).then(
-        bot_action, chatbot, chatbot
+        bot_action, [chatbot, fts_toggle], chatbot
     )
     msg.submit(user_action, [msg, chatbot], [msg, chatbot]).then(
-        bot_action, chatbot, chatbot
+        bot_action, [chatbot, fts_toggle], chatbot
     )
     chatbot.example_select(handle_example_click, chatbot, chatbot).then(
-        bot_action, chatbot, chatbot
+        bot_action, [chatbot, fts_toggle], chatbot
     )
     # Refresh Scripture List
     refresh_scripture_btn.click(fn=get_all_scriptures_table, outputs=scripture_table)
@@ -921,7 +998,7 @@ with gr.Blocks() as demo:
     # Scripture Table Selection Logic
     scripture_table.select(
         fn=get_verses_by_scripture,
-        inputs=[scripture_table, view_mode_toggle], # Added toggle input
+        inputs=[scripture_table, view_mode_toggle],  # Added toggle input
         outputs=[
             scripture_detail_header,
             scripture_enrichment_stats,
@@ -936,7 +1013,7 @@ with gr.Blocks() as demo:
     chars_table.select(
         fn=get_verses_for_character,
         outputs=[char_detail_header, char_verse_table],
-    )    
+    )
 
 if __name__ == "__main__":
     demo.queue().launch(

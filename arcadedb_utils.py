@@ -1,0 +1,582 @@
+import os
+import json
+import requests
+from dotenv import load_dotenv
+import gradio as gr
+import sqlite3
+import re
+
+# --- 1. Setup & Environment ---
+load_dotenv()
+# Use your ArcadeDB credentials from your .env
+ARCADE_USER = os.getenv("ARCADE_USER", "root")
+ARCADE_PASS = os.getenv("ARCADE_PASSWORD")
+ARCADE_DB = os.getenv("ARCADE_DB", "BhashyamDB")
+ARCADE_URL = f"http://216.48.187.234:2480/api/v1/command/{ARCADE_DB}"
+AUTH = (ARCADE_USER, ARCADE_PASS)
+
+def run_arcade_cypher(query, params=None):
+    """Refined ArcadeDB Cypher execution."""
+    # ArcadeDB sometimes prefers parameters without the '$' in the key,
+    # but with the '$' in the query string.
+    payload = {
+        "language": "cypher",
+        "command": query,
+        "params": params if params else {}
+    }
+    response = requests.post(ARCADE_URL, json=payload, auth=AUTH)
+    if response.status_code == 200:
+        return response.json().get("result", [])
+    else:
+        # This will help us see exactly what's failing in the logs
+        print(f"DEBUG PAYLOAD: {payload}")
+        raise Exception(f"ArcadeDB Error: {response.text}")
+
+# --- 2. Refactored Functions ---
+
+def get_all_characters_table_from_arcade(search_query=""):
+    # ArcadeDB Cypher is very similar
+    query = """
+    MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)-[r:MENTIONS]->(c:Character)
+    RETURN c.name AS name, count(r) AS verse_count
+    ORDER BY verse_count DESC
+    """
+    try:
+        result = run_arcade_cypher(query)
+        # ArcadeDB result is a list of dicts
+        all_chars = [[r["name"].title(), r["verse_count"]] for r in result]
+        
+        if search_query:
+            all_chars = [c for c in all_chars if search_query.lower() in c[0].lower()]
+        return all_chars
+    except Exception as e:
+        return [[f"Error: {e}", 0]]
+
+def get_verses_for_character_from_arcade(evt: gr.SelectData):
+    character_name = evt.value if isinstance(evt.value, str) else evt.value[0]
+
+    # Note: We use the same Cypher as Neo4j!
+    query = """
+    MATCH (c:Character {name: $char_name})<-[:MENTIONS]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    RETURN s.title AS scripture, 
+           v.relative_path AS verse, 
+           v.text AS text, 
+           v.translation AS translation,
+           v.word_by_word_native AS wbw
+    ORDER BY s.title, v.relative_path
+    LIMIT 100
+    """
+    try:
+        result = run_arcade_cypher(query, {"char_name": character_name})
+        details = []
+        for r in result:
+            wbw_str = format_wbw(r.get("wbw")) or "N/A"
+            details.append([
+                r["scripture"],
+                r["verse"],
+                r["text"],
+                r.get("translation") or "No translation available",
+                wbw_str,
+            ])
+        return f"### 🎭 Verses mentioning: {character_name}", details
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}", []
+
+def format_wbw(wbw_data):
+    """Safely converts WBW data (list or JSON string) into a readable string."""
+    if not wbw_data:
+        return ""
+
+    # Case 1: Already a list (driver-parsed)
+    if isinstance(wbw_data, list):
+        items = wbw_data
+    # Case 2: It's a string (needs parsing)
+    elif isinstance(wbw_data, str):
+        if wbw_data.strip().startswith("["):
+            try:
+                items = json.loads(wbw_data)
+            except:
+                return wbw_data  # Fallback to raw string
+        else:
+            return wbw_data  # It's a plain string
+    else:
+        return str(wbw_data)
+
+    # Format the list items
+    try:
+        parts = [
+            f"{i.get('word', '')}: {i.get('meaning', '')}"
+            for i in items
+            if isinstance(i, dict)
+        ]
+        return " | ".join(parts)
+    except:
+        return str(wbw_data)        
+
+def get_all_scriptures_table_arcade():
+    """Fetches scriptures with aggregated enrichment percentages for ArcadeDB."""
+    query = """
+    MATCH (s:Scripture)<-[:PART_OF]-(v:Verse)
+    WHERE v.text IS NOT NULL AND v.text <> ""
+    WITH s, count(v) AS total_verses
+    
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_t:Verse) 
+    WHERE v_t.text <> "" AND v_t.translation IS NOT NULL AND v_t.translation <> ""
+    WITH s, total_verses, count(v_t) AS t_count
+    
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_w:Verse) 
+    WHERE v_w.text <> "" AND v_w.word_by_word_native IS NOT NULL 
+      AND v_w.word_by_word_native <> "" 
+      AND v_w.word_by_word_native <> "[]"
+    WITH s, total_verses, t_count, count(v_w) AS w_count
+    
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_top:Verse) 
+    WHERE v_top.text <> "" AND size((v_top)-[:DISCUSSES]->(:Topic)) > 0
+    WITH s, total_verses, t_count, w_count, count(DISTINCT v_top) AS top_count
+
+    OPTIONAL MATCH (s)<-[:PART_OF]-(v_c:Verse) 
+    WHERE v_c.text <> "" AND size((v_c)-[:MENTIONS]->(:Character)) > 0
+    WITH s, total_verses, t_count, w_count, top_count, count(DISTINCT v_c) AS char_count
+    
+    WITH s, total_verses, t_count, w_count, top_count, char_count,
+         (t_count * 1.0 / total_verses) * 100 AS p_trans,
+         (w_count * 1.0 / total_verses) * 100 AS p_wbw,
+         (top_count * 1.0 / total_verses) * 100 AS p_topics,
+         (char_count * 1.0 / total_verses) * 100 AS p_chars
+         
+    RETURN s.title AS title, s.name AS internal_name, total_verses, 
+           ((p_trans + p_wbw + p_topics + p_chars) / 4.0) AS overall_enrichment
+    ORDER BY overall_enrichment DESC, title ASC
+    """
+    try:
+        # Using your new run_arcade_cypher helper
+        result = run_arcade_cypher(query)
+        
+        return [
+            [
+                r.get("title", "Unknown"),
+                r.get("total_verses", 0),
+                f"{round(r.get('overall_enrichment', 0), 2)}%",
+                r.get("internal_name", "")
+            ]
+            for r in result
+        ]
+    except Exception as e:
+        print(f"ArcadeDB Query Error: {e}")
+        return [[f"Error: {e}", 0, "0%", ""]]        
+
+def get_verses_by_scripture_arcade(evt: gr.SelectData, scripture_data, filter_mode):
+    selected_row = scripture_data.iloc[evt.index[0]]
+    scripture_title = selected_row["Scripture Title"]
+    internal_name = selected_row["internal_id"]
+
+    # 1. Fetch RAW data for stats (No aggregation in Cypher to avoid GENERATED-key error)
+    stats_query = f"""
+    MATCH (s:Scripture {{name: '{internal_name}'}})<-[:PART_OF]-(v:Verse)
+    WHERE v.text IS NOT NULL AND v.text <> ""
+    RETURN 
+        v.translation as trans, 
+        v.word_by_word_native as wbw,
+        size((v)-[:DISCUSSES]->()) as topic_count,
+        size((v)-[:MENTIONS]->()) as char_count
+    """
+
+    # 2. Fetch Verse Content (Decoupled)
+    filter_clause = "AND (v.translation IS NULL OR v.translation = '' OR size((v)-[:DISCUSSES]->()) = 0)" if filter_mode != "Show All" else ""
+    content_query = f"""
+    MATCH (s:Scripture {{name: '{internal_name}'}})<-[:PART_OF]-(v:Verse)
+    WHERE v.text IS NOT NULL AND v.text <> "" {filter_clause}
+    WITH v ORDER BY v.unit_index ASC LIMIT 500
+    RETURN 
+        v.relative_path as relative_path, 
+        v.text as text, 
+        v.translation as translation, 
+        v.word_by_word_native as wbw, 
+        v.global_id as global_id,
+        [(v)-[:DISCUSSES]->(t:Topic) | t.name] as topics,
+        [(v)-[:MENTIONS]->(c:Character) | c.name] as characters
+    """
+
+    try:
+        # --- Process Stats in Python ---
+        raw_stats = run_arcade_cypher(stats_query)
+        if not raw_stats: return "### No data", "", []
+
+        total = len(raw_stats)
+        t_count = len([r for r in raw_stats if r.get("trans")])
+        w_count = len([r for r in raw_stats if r.get("wbw") and r["wbw"] != "[]"])
+        top_count = len([r for r in raw_stats if r.get("topic_count", 0) > 0])
+        char_count = len([r for r in raw_stats if r.get("char_count", 0) > 0])
+
+        p_trans = round((t_count * 100.0 / total), 2)
+        p_wbw = round((w_count * 100.0 / total), 2)
+        p_topics = round((top_count * 100.0 / total), 2)
+        p_chars = round((char_count * 100.0 / total), 2)
+
+        stats_md = (
+            f"| 🎭 Characters | 🏷️ Topics | 🔤 Word-by-Word | 🌐 Translation |\n"
+            f"|:---:|:---:|:---:|:---:|\n"
+            f"| **{p_chars}%** | **{p_topics}%** | **{p_wbw}%** | **{p_trans}%** |"
+        )
+
+        # --- Process Content ---
+        verses_res = run_arcade_cypher(content_query)
+        details = []
+        for v in verses_res:
+            details.append([
+                v["relative_path"],
+                v["text"],
+                v.get("translation") or "No translation",
+                format_wbw(v.get("wbw")) or "N/A",
+                ", ".join(v["topics"]) if v["topics"] else "---",
+                ", ".join(v["characters"]) if v["characters"] else "---",
+                v.get("global_id", ""),
+            ])
+
+        mode_label = " (Pending Enrichment)" if filter_mode != "Show All" else ""
+        return f"### 📜 {scripture_title} - {total} Total Verses{mode_label}", stats_md, details
+
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}", "", []
+
+def get_enrichment_stats_arcade():
+    """Global stats - Pure Graph Traversal (No size() calls)"""
+    
+    # 1. Total and Enriched Count (Stable)
+    q1 = """
+    MATCH (v:Verse) 
+    WHERE v.text IS NOT NULL AND v.text <> ""
+    RETURN count(v) as total, 
+           count(v.translation) as with_trans
+    """
+
+    # 2. Linked Topics Count (Stable)
+    q2 = """
+    MATCH (v:Verse)-[:DISCUSSES]->(t:Topic)
+    RETURN count(DISTINCT v) as with_topics
+    """
+
+    # 3. Topic Global Stats - REFACTORED to avoid GENERATED-key error
+    q3 = """
+    MATCH (t:Topic)
+    WITH count(t) as total_topics
+    OPTIONAL MATCH (ot:Topic)
+    WHERE NOT (ot)<-[:DISCUSSES]-(:Verse)
+    RETURN total_topics, count(DISTINCT ot) as orphaned_topics
+    """
+    
+    try:
+        res1 = run_arcade_cypher(q1)
+        res2 = run_arcade_cypher(q2)
+        res3 = run_arcade_cypher(q3)
+        
+        if not res1 or not res2 or not res3:
+            return "### 📊 Database empty."
+
+        r1, r2, r3 = res1[0], res2[0], res3[0]
+        
+        total = r1["total"] or 1
+        p_trans = round((r1["with_trans"] / total) * 100, 2)
+        p_topics = round((r2["with_topics"] / total) * 100, 2)
+
+        return f"""
+### 📊 Migration Progress
+- **Total Verses:** {total:,}
+- **Enriched (Translations):** {p_trans}%
+- **Linked Topics:** {p_topics}%
+
+### 🏷️ Topic Stats
+- **Total Topics:** {r3['total_topics']:,}
+- **Orphaned Topics:** {r3['orphaned_topics']:,} 
+"""
+    except Exception as e:
+        print(f"Stats Error: {e}")
+        return f"⚠️ Stats Error: {str(e)}"
+
+def get_verses_for_topic_arcade(evt: gr.SelectData):
+    """Fetches all verses linked to a selected topic from ArcadeDB."""
+    global TOPIC_TO_NODES_MAP
+    clean_topic_name = evt.value if isinstance(evt.value, str) else evt.value[0]
+    raw_names = TOPIC_TO_NODES_MAP.get(clean_topic_name, [])
+
+    if not raw_names:
+        return f"### No raw mapping found for: {clean_topic_name}", []
+
+    # Cypher remains largely the same, but LIMIT is kept safe for 8GB RAM
+    query = """
+    MATCH (t:Topic)<-[:DISCUSSES]-(v:Verse)-[:PART_OF]->(s:Scripture)
+    WHERE t.name IN $raw_names
+    RETURN s.title AS scripture, 
+           v.relative_path AS verse, 
+           v.text AS text, 
+           v.translation AS translation,
+           v.word_by_word_native AS wbw
+    LIMIT 2000
+    """
+
+    try:
+        # Use our ArcadeDB helper
+        result = run_arcade_cypher(query, {"raw_names": raw_names})
+        
+        details = []
+        for r in result:
+            # ArcadeDB might return None for missing fields; use .get()
+            wbw_str = format_wbw(r.get("wbw")) or "N/A"
+
+            details.append([
+                r.get("scripture", "Unknown"),
+                r.get("verse", "N/A"),
+                r.get("text", ""),
+                r.get("translation") or "No translation available",
+                wbw_str,
+            ])
+
+        if not details:
+            return f"### No verses found for: {clean_topic_name}", []
+
+        return f"### 📖 Verses discussing: {clean_topic_name}", details
+        
+    except Exception as e:
+        print(f"Topic Detail Error: {e}")
+        return f"⚠️ Error: {str(e)}", []        
+
+def get_all_topics_table_arcade(search_query=""):
+    global TOPIC_TO_NODES_MAP
+    
+    # --- ADD THESE TWO LINES ---
+    numbered_p = re.compile(r"^\d+\.\s*")
+    bullet_p = re.compile(r"^[ \t]*[-*:]+[ \t]*")
+    # ---------------------------
+
+    excluded = ["yt_metadata"]
+    excluded_str = json.dumps(excluded)
+
+    query = f"""
+    MATCH (s:Scripture)
+    WHERE NOT s.name IN {excluded_str}
+    MATCH (s)<-[:PART_OF]-(v:Verse)-[r:DISCUSSES]->(t:Topic)
+    RETURN t.name AS name, count(r) AS verse_count
+    """
+    
+    try:
+        # Call without the second 'params' argument
+        result = run_arcade_cypher(query)
+        
+        aggregated_topics = {}
+        TOPIC_TO_NODES_MAP = {}
+        
+        for record in result:
+            # ArcadeDB returns a list of dictionaries
+            raw_node_name = record.get("name")
+            count = record.get("verse_count", 0)
+            
+            if not raw_node_name:
+                continue
+
+            # 1. Strip brackets/quotes and split (Your existing logic is perfect)
+            clean_name = re.sub(r"[\[\]\"']", "", str(raw_node_name))
+            parts = re.split(r",|\n", clean_name)
+
+            for p in parts:
+                t = p.strip()
+                t = numbered_p.sub("", t)
+                t = bullet_p.sub("", t)
+                display_name = t.strip("*:- ").title()
+
+                if display_name and len(display_name) > 1:
+                    # 2. Aggregate counts
+                    aggregated_topics[display_name] = (
+                        aggregated_topics.get(display_name, 0) + count
+                    )
+
+                    # 3. Map back to Raw Name for the Detail view lookup
+                    if display_name not in TOPIC_TO_NODES_MAP:
+                        TOPIC_TO_NODES_MAP[display_name] = []
+                    if raw_node_name not in TOPIC_TO_NODES_MAP[display_name]:
+                        TOPIC_TO_NODES_MAP[display_name].append(raw_node_name)
+
+        # Unpack into list of lists for Gradio Dataframe
+        all_topics = [[name, count] for name, count in aggregated_topics.items()]
+
+        if search_query:
+            all_topics = [
+                t for t in all_topics if search_query.lower() in t[0].lower()
+            ]
+
+        # Sort by Count DESC, then Name ASC
+        all_topics.sort(key=lambda x: (-x[1], x[0]))
+
+        return all_topics
+
+    except Exception as e:
+        print(f"Topic Table Error: {e}")
+        return [[f"Error: {e}", 0]]        
+
+def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
+    try:
+        # 1. Fetch metadata using ArcadeDB helper
+        s_result = run_arcade_cypher("MATCH (s:Scripture) RETURN s.name AS name")
+        available_scriptures = [record["name"] for record in s_result]
+        
+        a_result = run_arcade_cypher("MATCH (a:Author) RETURN a.name AS name LIMIT 100")
+        available_authors = [record["name"] for record in a_result]
+    except Exception as e:
+        print(f"Error fetching metadata: {e}")
+        return [], {}
+
+    # 2. LLM Extraction (Remains the same as your Neo4j version)
+    extraction_prompt = f"""
+    Identify entities and search keywords in the user query.
+    VALID SCRIPTURES: {available_scriptures}
+    VALID AUTHORS: {available_authors}
+    Question: "{user_query}"
+    Return JSON: {{ "scriptures": [], "authors": [], "characters": [], "topics": [], "search_keywords": [] }}
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": extraction_prompt}],
+        response_format={"type": "json_object"},
+    )
+    ents = json.loads(response.choices[0].message.content)
+
+    # 3. Build Search Params
+    keywords = ents.get("search_keywords", [])
+    # ArcadeDB Lucene syntax for fuzzy search
+    search_string = " OR ".join([f"{k}~2" for k in keywords if k])
+
+    params = {
+        "scriptures": ents.get("scriptures", []),
+        "authors": ents.get("authors", []),
+        "topics": [t.strip().title() for t in ents.get("topics", [])],
+        "characters": [c.strip().title() for c in ents.get("characters", [])],
+        "search_string": search_string,
+        "use_fts": use_fts
+    }
+
+    # 4. ArcadeDB Optimized Cypher (Lucene + Graph)
+    # Note: Replace 'VerseTextIndex' with the actual name of your Lucene index
+    cypher_query = """
+    // 1. Identify Graph matches using size() for speed
+    MATCH (v:Verse)
+    WHERE size([ (v)-[:MENTIONS]->(c:Character) WHERE toLower(c.name) IN [x IN $characters | toLower(x)] | c ]) > 0
+    WITH collect(DISTINCT v) AS char_verses
+    
+    MATCH (v:Verse)
+    WHERE size([ (v)-[:DISCUSSES]->(t:Topic) WHERE toLower(t.name) IN [x IN $topics | toLower(x)] | t ]) > 0
+    WITH char_verses, collect(DISTINCT v) AS top_verses
+
+    // 2. Combine with Full-Text Search
+    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+    WHERE v IN char_verses 
+       OR v IN top_verses 
+       OR ($use_fts = true AND v SEARCH $search_string)
+
+    WITH v, s, char_verses, top_verses
+    
+    // 3. Simple Scoring (ArcadeDB provides 'score()' if using a native SEARCH block)
+    WITH v, s,
+         (CASE WHEN v IN char_verses THEN 5000 ELSE 0 END) AS char_boost,
+         (CASE WHEN v IN top_verses THEN 1000 ELSE 0 END) AS topic_boost
+         
+    WITH v, s, (char_boost + topic_boost) AS total_score
+    ORDER BY total_score DESC
+    LIMIT 15
+    
+    RETURN s.title AS scripture, v.relative_path AS verse_title, 
+           v.text AS verse_text, v.translation AS meaning, 
+           v.word_by_word_native AS wbw
+    """
+
+    context_data = []
+    try:
+        # Fallback if no keywords were identified
+        active_query = cypher_query if params["search_string"] else """
+            MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+            WHERE (size($topics) > 0 AND size([ (v)-[:DISCUSSES]->(t:Topic) WHERE t.name IN $topics | t ]) > 0)
+               OR (size($scriptures) > 0 AND s.name IN $scriptures)
+            RETURN s.title AS scripture, v.relative_path AS verse_title, 
+                   v.text AS verse_text, v.translation AS meaning, 
+                   v.word_by_word_native AS wbw
+            ORDER BY size((v)-[:DISCUSSES]->()) DESC
+            LIMIT 15
+        """
+        
+        result = run_arcade_cypher(active_query, params)
+        for record in result:
+            context_data.append({
+                "scripture": record.get("scripture", "Unknown"),
+                "verse": record.get("verse_title", "N/A"),
+                "verse_text": record.get("verse_text", ""),
+                "meaning": f"{record.get('meaning') or ''}\n{format_wbw(record.get('wbw'))}",
+            })
+    except Exception as e:
+        print(f"Chat Search Error: {e}")
+
+    return context_data, params        
+
+def update_topic_everywhere_arcade(old_name, new_name):
+    new_topics_list = [t.strip() for t in new_name.split(",") if t.strip()]
+    if not new_topics_list:
+        return "⚠️ Error: New name cannot be empty."
+
+    # 1. Update SQLite Cache (Stays the same)
+    SQLITE_PATH = "../bhashyamai_data_editor/llm_cache.db"
+    conn = sqlite3.connect(SQLITE_PATH)
+    cursor = conn.cursor()
+
+    try:
+        # Updating keywords table
+        cursor.execute("SELECT hash, topics FROM keywords")
+        for h, topics_json in cursor.fetchall():
+            topics = json.loads(topics_json)
+            if old_name in topics:
+                updated = [t for t in topics if t != old_name]
+                for nt in new_topics_list:
+                    if nt not in updated: updated.append(nt)
+                cursor.execute("UPDATE keywords SET topics = ? WHERE hash = ?", 
+                               (json.dumps(updated, ensure_ascii=False), h))
+
+        # Updating verse_enrichment table
+        cursor.execute("SELECT hash, data FROM verse_enrichment")
+        for h, data_json in cursor.fetchall():
+            data = json.loads(data_json)
+            if "topics" in data and old_name in data["topics"]:
+                updated = [t for t in data["topics"] if t != old_name]
+                for nt in new_topics_list:
+                    if nt not in updated: updated.append(nt)
+                data["topics"] = updated
+                cursor.execute("UPDATE verse_enrichment SET data = ? WHERE hash = ?", 
+                               (json.dumps(data, ensure_ascii=False), h))
+        conn.commit()
+
+        # 2. Update ArcadeDB (Graph Storage)
+        # We perform this in a single script for atomicity
+        arcade_script = """
+        // Find verses linked to the old topic
+        MATCH (oldT:Topic {name: $old_name})
+        OPTIONAL MATCH (v:Verse)-[r:DISCUSSES]->(oldT)
+        WITH oldT, collect(v) as verses
+        
+        // Create/Merge the new topics
+        UNWIND $new_list AS new_t_name
+        MERGE (newT:Topic {name: new_t_name})
+        
+        // Relink verses to new topics
+        WITH verses, oldT, newT
+        UNWIND verses as v
+        MERGE (v)-[:DISCUSSES]->(newT)
+        
+        // Remove the old topic and its relationships
+        WITH DISTINCT oldT
+        DETACH DELETE oldT
+        """
+        
+        run_arcade_cypher(arcade_script, {"old_name": old_name, "new_list": new_topics_list})
+
+        return f"✅ Successfully split '{old_name}' into {new_topics_list} in SQLite and ArcadeDB"
+        
+    except Exception as e:
+        print(f"Update Error: {e}")
+        return f"⚠️ Update Error: {str(e)}"
+    finally:
+        conn.close()    

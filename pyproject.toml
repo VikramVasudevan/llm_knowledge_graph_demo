@@ -10,4 +10,5 @@ dependencies = [
     "openai>=2.24.0",
     "python-dotenv>=1.2.1",
     "pyvis>=0.3.2",
+    "requests>=2.33.1",
 ]
