@@ -326,17 +326,20 @@ with gr.Blocks() as demo:
 
     # Tab Select: Run Reconciliation Automatically
     maintenance_tab.select(
-        fn=lambda: ("⏳ Loading reconciliation data...", gr.update(interactive=False)),
-        outputs=[reconciliation_report, fix_btn]
+        fn=lambda: ("⏳ Loading reconciliation data...", gr.update(interactive=False), gr.update(interactive=False)),
+        outputs=[reconciliation_report, fix_btn, reconcile_btn]
     ).then(
         fn=reconcile_neo4j_with_arcade,
         outputs=[reconciliation_report, fix_btn]
+    ).then(
+        fn=lambda: gr.update(interactive=True),
+        outputs=reconcile_btn
     )
 
     # Reconciliation Event (Manual)
     reconcile_btn.click(
-        fn=lambda: (gr.update(interactive=False), gr.update(interactive=False), "⏳ Starting reconciliation process..."),
-        outputs=[reconcile_btn, fix_btn, reconciliation_report]
+        fn=lambda: ("⏳ Starting reconciliation process...", gr.update(interactive=False), gr.update(interactive=False)),
+        outputs=[reconciliation_report, fix_btn, reconcile_btn]
     ).then(
         fn=reconcile_neo4j_with_arcade,
         outputs=[reconciliation_report, fix_btn]
