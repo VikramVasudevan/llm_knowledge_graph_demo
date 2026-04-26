@@ -1,6 +1,18 @@
 import os
 import json
-from arcadedb_utils import get_all_characters_table_from_arcade, get_all_scriptures_table_arcade, get_all_topics_table_arcade, get_enrichment_stats_arcade, get_perspectives_from_graph_arcade, get_verses_by_scripture_arcade, get_verses_for_character_from_arcade, get_verses_for_topic_arcade, update_topic_everywhere_arcade
+from arcadedb_utils import (
+    get_all_characters_table_from_arcade,
+    get_all_scriptures_table_arcade,
+    get_all_topics_table_arcade,
+    get_enrichment_stats_arcade,
+    get_perspectives_from_graph_arcade,
+    get_verses_by_scripture_arcade,
+    get_verses_for_character_from_arcade,
+    get_verses_for_topic_arcade,
+    update_topic_everywhere_arcade,
+    reconcile_neo4j_with_arcade,
+    fix_mismatches_sequentially,
+)
 from dotenv import load_dotenv
 from gradio.components.chatbot import ExampleMessage
 from openai import OpenAI
@@ -295,7 +307,55 @@ with gr.Blocks() as demo:
                         # Balanced widths: ID(10), Text(15), Trans(20), WBW(20), Topics(15), Chars(15), Global(5)
                         column_widths=["10%", "15%", "20%", "20%", "15%", "15%", "5%"],
                     )
+        # --- Tab 4: System Maintenance ---
+        with gr.Tab("🛠️ System Maintenance") as maintenance_tab:
+            gr.Markdown("### ⚙️ Database Reconciliation & Integrity")
+            gr.Markdown("Compare the current ArcadeDB graph with the source Neo4j graph to ensure 100% data consistency.")
+            
+            with gr.Row():
+                with gr.Column(scale=1, min_width=200):
+                    reconcile_btn = gr.Button("🔍 Run Full Reconciliation", variant="primary")
+                with gr.Column(scale=1, min_width=200):
+                    fix_btn = gr.Button("🛠️ Fix Mismatches", variant="secondary")
+                with gr.Column(scale=2):
+                    pass # Spacer to keep buttons on the left
+            
+            reconciliation_report = gr.Markdown("Click 'Run Reconciliation' to start...")
+
     # --- Event Bindings ---
+
+    # Tab Select: Run Reconciliation Automatically
+    maintenance_tab.select(
+        fn=lambda: ("⏳ Loading reconciliation data...", gr.update(interactive=False)),
+        outputs=[reconciliation_report, fix_btn]
+    ).then(
+        fn=reconcile_neo4j_with_arcade,
+        outputs=[reconciliation_report, fix_btn]
+    )
+
+    # Reconciliation Event (Manual)
+    reconcile_btn.click(
+        fn=lambda: (gr.update(interactive=False), gr.update(interactive=False), "⏳ Starting reconciliation process..."),
+        outputs=[reconcile_btn, fix_btn, reconciliation_report]
+    ).then(
+        fn=reconcile_neo4j_with_arcade,
+        outputs=[reconciliation_report, fix_btn]
+    ).then(
+        fn=lambda: gr.update(interactive=True),
+        outputs=reconcile_btn
+    )
+
+    # Fix Mismatches Event
+    fix_btn.click(
+        fn=lambda: (gr.update(interactive=False), gr.update(interactive=False), "⏳ Starting automated fix..."),
+        outputs=[reconcile_btn, fix_btn, reconciliation_report]
+    ).then(
+        fn=fix_mismatches_sequentially,
+        outputs=reconciliation_report
+    ).then(
+        fn=lambda: (gr.update(interactive=True), gr.update(interactive=True)),
+        outputs=[reconcile_btn, fix_btn]
+    )
 
     # Refresh Statistics Sidebar
     refresh_stats_btn.click(get_enrichment_stats, outputs=stats_sidebar)

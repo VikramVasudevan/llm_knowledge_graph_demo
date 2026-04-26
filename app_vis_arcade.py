@@ -1,214 +1,263 @@
 import base64
 import os
-import random
 import tempfile
-import json
 import requests
 from dotenv import load_dotenv
 import gradio as gr
 from pyvis.network import Network
+from flask import Flask, request, jsonify
+import threading
+from flask_cors import CORS
 
 load_dotenv()
 
-# --- ArcadeDB Connection Settings ---
-ARCADE_USER = os.getenv("ARCADE_USER", "root")
-ARCADE_PASS = os.getenv("ARCADE_PASSWORD")
-ARCADE_DB = os.getenv("ARCADE_DB", "BhashyamDB")
-ARCADE_URL = f"http://216.48.187.234:2480/api/v1/command/{ARCADE_DB}"
-AUTH = (ARCADE_USER, ARCADE_PASS)
+# --- Configuration ---
+ARCADE_URL = f"http://{os.getenv('ARCADE_HOST')}:2480/api/v1/command/{os.getenv('ARCADE_DB', 'BhashyamDB')}"
+AUTH = (os.getenv("ARCADE_USER", "root"), os.getenv("ARCADE_PASSWORD"))
 
-def run_arcade_cypher(query):
-    """Utility to execute Cypher on ArcadeDB via REST."""
-    payload = {"language": "cypher", "command": query, "parameters": {}}
+# --- Backend Logic ---
+
+def run_arcade_cypher(query, params=None):
+    payload = {"language": "cypher", "command": query, "params": params or {}}
     try:
         response = requests.post(ARCADE_URL, json=payload, auth=AUTH, timeout=30)
-        if response.status_code == 200:
-            return response.json().get("result", [])
-        print(f"ArcadeDB Error: {response.text}")
-        return []
+        print(response.text)
+        return response.json().get("result", []) if response.status_code == 200 else []
     except Exception as e:
-        print(f"Request Error: {e}")
+        print(f"run_arcade_cypher error: {e}")
         return []
 
-# --- Helper Functions ---
 
-def get_scriptures():
-    """Fetch all available scriptures."""
-    result = run_arcade_cypher("MATCH (s:Scripture) RETURN s.name AS name ORDER BY name")
-    return [r["name"] for r in result]
-
-def get_chapters(scripture_name):
-    """Fetch top-level Chapters for the selected scripture."""
-    query = f"MATCH (s:Scripture {{name: '{scripture_name}'}})<-[:PART_OF]-(c:Chapter) WHERE c.level = 1 OR c.level IS NULL RETURN c.name AS name ORDER BY name"
-    result = run_arcade_cypher(query)
-    return [r["name"] for r in result]
-
-def get_color(type_name):
-    """Consistent color coding."""
-    colors = {
-        "prabandham": "#E74C3C", # Red
-        "pathu": "#F1C40F",      # Yellow
-        "song": "#3498DB",       # Blue
-        "author": "#9B59B6",     # Purple
-        "location": "#2ECC71"    # Green
-    }
-    return colors.get(type_name.lower(), "#95A5A6")
-
-# --- Main Graph Generation ---
-
-def generate_graph(scripture_name, prabandham_name):
-    s_name = scripture_name.strip()
-    p_name = prabandham_name.strip()
-
-    if not s_name or not p_name:
-        return "<h3>Please select both a Scripture and a Prabandham.</h3>"
-
-    # Initialize Pyvis
-    net = Network(height="750px", width="100%", bgcolor="#1a1a1a", font_color="white", directed=True)
-    net.barnes_hut(gravity=-3500, central_gravity=0.3, spring_length=150)
-
-    # Master Query: Returns root, immediate children (c1), and their children (c2)
-    query = f"""
-    MATCH (p:Chapter) 
-    WHERE toLower(p.name) = toLower("{p_name}") 
-    AND toLower(p.scripture) = toLower("{s_name}")
-    
-    OPTIONAL MATCH (c1:Chapter)-[:PART_OF]-(p)
-    WHERE c1 <> p
-    
-    OPTIONAL MATCH (c2:Chapter)-[:PART_OF]-(c1)
-    WHERE c2 <> c1 AND c2 <> p
-    
-    OPTIONAL MATCH (a:Author)-[:CONTRIBUTED_TO]-(p)
-    OPTIONAL MATCH (p)-[:LOCATED_AT]-(l:Location)
-    
-    RETURN p as root, c1, c2, a, l
+# Root chapters: book-level (no incoming PART_OF from another Chapter) — used for UI lists.
+def fetch_scripture_choices():
+    query = """
+    MATCH (p:Chapter)
+    WHERE NOT (p)<-[:PART_OF]-(:Chapter)
+    RETURN DISTINCT p.scripture AS scripture
     """
+    rows = run_arcade_cypher(query)
+    return sorted(
+        s for s in (r.get("scripture") for r in rows)
+        if s
+    )
 
-    results = run_arcade_cypher(query)
-    if not results:
-        return f"<h3>No data found for '{p_name}'.</h3>"
 
-    added_nodes = set()
+def fetch_prabandham_choices(scripture):
+    if not scripture:
+        return []
+    query = """
+    MATCH (p:Chapter)
+    WHERE p.scripture = $scripture AND NOT (p)<-[:PART_OF]-(:Chapter)
+    RETURN DISTINCT p.name AS name
+    """
+    rows = run_arcade_cypher(query, {"scripture": scripture})
+    return sorted(
+        n for n in (r.get("name") for r in rows)
+        if n
+    )
+
+# --- Gradio + API "The Bridge" ---
+# --- 1. THE INITIAL UI FETCH (Load Root + Decades) ---
+def get_initial_graph(scripture, prabandham):
+    net = Network(height="700px", width="100%", bgcolor="#1a1a1a", font_color="white", directed=True)
+    net.barnes_hut(gravity=-3000, central_gravity=0.3, spring_length=150)
     
-    for r in results:
-        root = r.get("root")
-        if not root: continue
-        
-        # 1. Add Root Prabandham
-        root_rid = str(root["@rid"])
-        if root_rid not in added_nodes:
-            net.add_node(root_rid, label=f"Prabandham: {root['name']}", 
-                         color=get_color("prabandham"), size=35, group="root")
-            added_nodes.add(root_rid)
+    # Updated Query: Fetches Root, Author, and the First Level of Chapters (Decades)
+    query = f"""
+    MATCH (p:Chapter {{name: "{prabandham}", scripture: "{scripture}"}})
+    OPTIONAL MATCH (p)<-[r:PART_OF]-(d:Chapter)
+    OPTIONAL MATCH (a:Author)-[:CONTRIBUTED_TO]->(p)
+    RETURN p, a, collect(d) as decades
+    """
+    results = run_arcade_cypher(query)
+    if not results: return None
+    
+    res = results[0]
+    p_node = res['p']
+    p_rid = str(p_node['@rid'])
+    
+    # Add Root
+    net.add_node(p_rid, label=f"📜 {p_node['name']}", color="#E74C3C", size=40, shape="box")
+    
+    # Add Author
+    if res.get('a'):
+        a_rid = str(res['a']['@rid'])
+        net.add_node(a_rid, label=f"✍️ {res['a']['name']}", color="#9B59B6", size=35, shape="diamond")
+        net.add_edge(a_rid, p_rid, color="#9B59B6")
 
-        # 2. Add Level 1 (Pathus)
-        c1 = r.get("c1")
-        if c1:
-            c1_rid = str(c1["@rid"])
-            if c1_rid not in added_nodes:
-                net.add_node(c1_rid, label=f"Pathu: {c1['name']}", 
-                             color=get_color("pathu"), size=25, group="pathu")
-                net.add_edge(root_rid, c1_rid, color="#888888")
-                added_nodes.add(c1_rid)
+    # Add Decades (The First Level)
+    for d in res.get('decades', []):
+        if d:
+            d_rid = str(d['@rid'])
+            net.add_node(d_rid, label=d['name'], color="#F1C40F", size=28)
+            net.add_edge(d_rid, p_rid, color="#F1C40F", width=2)
 
-            # 3. Add Level 2 (Songs) - HIDDEN initially
-            c2 = r.get("c2")
-            if c2:
-                c2_rid = str(c2["@rid"])
-                if c2_rid not in added_nodes:
-                    net.add_node(c2_rid, label=f"Padigam: {c2['name']}", 
-                                 color=get_color("song"), size=15, hidden=True, group="song")
-                    net.add_edge(c1_rid, c2_rid, color="#444444", hidden=True)
-                    added_nodes.add(c2_rid)
+    return net
 
-        # 4. Add Authors
-        auth = r.get("a")
-        if auth:
-            a_rid = str(auth["@rid"])
-            if a_rid not in added_nodes:
-                net.add_node(a_rid, label=f"Author: {auth['name']}", 
-                             color=get_color("author"), shape="diamond", group="metadata")
-                net.add_edge(a_rid, root_rid, color="#9B59B6")
-                added_nodes.add(a_rid)
-
-        # 5. Add Locations
-        loc = r.get("l")
-        if loc:
-            l_rid = str(loc["@rid"])
-            if l_rid not in added_nodes:
-                net.add_node(l_rid, label=f"Location: {loc['name']}", 
-                             color=get_color("location"), shape="triangle", group="metadata")
-                net.add_edge(root_rid, l_rid, color="#2ECC71", dashes=True)
-                added_nodes.add(l_rid)
-
-    return render_pyvis_html(net)
-
-def render_pyvis_html(net):
-    """Converts Pyvis network to HTML with enhanced JS for drill-down."""
+# --- 2. THE EXPAND ENDPOINT (The "Greedy" Fix) ---
+def generate_ui(scripture, prabandham):
+    net = get_initial_graph(scripture, prabandham)
+    if not net: return "<h3>No data found.</h3>"
+    
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
     net.save_graph(temp_file.name)
     with open(temp_file.name, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    
-    # ENHANCED JS: 
-    # 1. Targets neighbors by group ('song') to prevent vanishing parents.
-    # 2. Specifically toggles edges between Pathu and Song.
-    custom_js = """
+        html = f.read()
+
+    # JAVASCRIPT: Calls OUR local server instead of ArcadeDB
+    drill_down_js = """
     <script type="text/javascript">
-    network.on("doubleClick", function (params) {
+    network.on("doubleClick", async function (params) {
         if (params.nodes.length > 0) {
-            var clickedNodeId = params.nodes[0];
-            var neighbors = network.getConnectedNodes(clickedNodeId);
-            var updates = [];
+            const nodeId = params.nodes[0];
             
-            neighbors.forEach(function(neighborId) {
-                var node = nodes.get(neighborId);
-                // ONLY toggle if the neighbor is a "song" (size 15)
-                // This prevents Pathus from hiding the Prabandham or Authors.
-                if (node && node.size === 15) {
-                    var newHiddenState = !node.hidden;
-                    updates.push({id: neighborId, hidden: newHiddenState});
-                    
-                    // Update only the edges connected to this specific song
-                    var connectedEdges = network.getConnectedEdges(neighborId);
-                    connectedEdges.forEach(function(edgeId) {
-                        edges.update({id: edgeId, hidden: newHiddenState});
-                    });
+            // We MUST use an absolute URL because the iframe is running from a Data URI
+            // Default to localhost, but you can change this to your server's IP if remote
+            const rootUrl = window.location.protocol === 'https:' ? 'https://' : 'http://';
+            const PROXY_URL = "http://127.0.0.1:5001/expand?rid=";
+            
+            console.log("Fetching from:", PROXY_URL + encodeURIComponent(nodeId));
+
+            try {
+                const response = await fetch(PROXY_URL + encodeURIComponent(nodeId));
+                
+                if (!response.ok) {
+                    throw new Error("HTTP error! status: " + response.status);
                 }
-            });
-            nodes.update(updates);
+
+                const data = await response.json();
+                
+                if (!data || data.length === 0) {
+                    console.log("No further children or metadata found.");
+                    return;
+                }
+
+                data.forEach(item => {
+                    // 1. Add node if it doesn't exist
+                    if (!nodes.get(item.id)) {
+                        nodes.add({
+                            id: item.id,
+                            label: item.label,
+                            color: item.color,
+                            size: item.size,
+                            shape: item.shape || 'dot',
+                            font: { color: 'white' }
+                        });
+                    }
+                    // 2. Add edge
+                    edges.add({ 
+                        from: item.from, 
+                        to: item.to, 
+                        color: item.color, 
+                        width: 1,
+                        dashes: item.dashes || false 
+                    });
+                });
+            } catch (err) {
+                console.error("Bhashyam Drilldown Error:", err);
+            }
         }
     });
     </script>
     """
     
-    dark_style = """
-    <style>
-        body, #mynetwork { background-color: #1a1a1a !important; }
-        .vis-label { color: white !important; font-family: 'Arial'; }
-    </style>
+    html = html.replace("</body>", f"{drill_down_js}</body>")
+    encoded = base64.b64encode(html.encode()).decode()
+    return f'<iframe src="data:text/html;base64,{encoded}" style="width: 100%; height: 750px; border: none;"></iframe>'
+
+# --- The Proxy Server (Flask) ---
+# We run a tiny Flask server in a thread to handle the JS requests
+
+app = Flask(__name__)
+CORS(app)
+
+@app.route('/expand')
+def expand():
+    rid_raw = request.args.get('rid')
+    print(f"--- Drilling into RID: {rid_raw} ---")
+
+    # In ArcadeDB Cypher, @rid is used directly. 
+    # Wrapping it in quotes is usually required for the string-to-RID conversion.
+    query = f"""
+    MATCH (n) 
+    WHERE n.@rid = '{rid_raw}'
+    OPTIONAL MATCH (n)<-[r:PART_OF|IN_CHAPTER]-(child)
+    OPTIONAL MATCH (n)-[rm:LOCATED_AT|DISCUSSES|MENTIONS|CHARACTER_OF]-(meta)
+    RETURN child, meta, labels(child) as cLabels, labels(meta) as mLabels
     """
     
-    html_content = html_content.replace("</head>", f"{dark_style}</head>")
-    html_content = html_content.replace("</body>", f"{custom_js}</body>")
-    
-    encoded_html = base64.b64encode(html_content.encode("utf-8")).decode("utf-8")
-    return f'<iframe src="data:text/html;base64,{encoded_html}" style="width: 100%; height: 750px; border: none;"></iframe>'
+    results = run_arcade_cypher(query)
+    payload = []
 
-# --- UI Layout ---
+    for row in results:
+        # Handle Children (Chapters/Verses)
+        if row.get('child'):
+            c = row['child']
+            c_rid = str(c['@rid'])
+            labels = row.get('cLabels', [])
+            
+            payload.append({
+                "id": c_rid,
+                "label": c.get('name') or f"Verse {c.get('unit_index', '')}",
+                "color": "#2ECC71" if "Verse" in labels else "#3498DB",
+                "size": 12 if "Verse" in labels else 20,
+                "from": c_rid, "to": rid_raw
+            })
+
+        # Handle Metadata
+        if row.get('meta'):
+            m = row['meta']
+            m_rid = str(m['@rid'])
+            labels = row.get('mLabels', [])
+            
+            payload.append({
+                "id": m_rid,
+                "label": m.get('name') or m.get('title'),
+                "shape": "triangle" if "Location" in labels else "diamond",
+                "color": "#E67E22",
+                "from": m_rid, "to": rid_raw, "dashes": True
+            })
+
+    return jsonify(payload)
+
+
+def run_flask():
+    app.run(port=5001, debug=False, use_reloader=False)
+
+# --- UI ---
+def on_scripture_change(scripture):
+    prabs = fetch_prabandham_choices(scripture)
+    return gr.update(choices=prabs, value=prabs[0] if prabs else None)
+
+
+_scripture_choices = fetch_scripture_choices()
+_default_scripture = _scripture_choices[0] if _scripture_choices else None
+_prabandham_choices = (
+    fetch_prabandham_choices(_default_scripture) if _default_scripture else []
+)
+
 with gr.Blocks() as demo:
-    gr.Markdown("# 🕉️ Bhashyam.AI Graph Explorer")
+    gr.Markdown("# 🕉️ Bhashyam.AI Secure Graph")
     with gr.Row():
         with gr.Column(scale=1):
-            s_drop = gr.Dropdown(choices=get_scriptures(), label="1. Scripture")
-            p_drop = gr.Dropdown(choices=[], label="2. Prabandham")
-            btn = gr.Button("Generate Web", variant="primary")
+            s_drop = gr.Dropdown(
+                choices=_scripture_choices,
+                label="Scripture",
+                value=_default_scripture,
+            )
+            p_drop = gr.Dropdown(
+                choices=_prabandham_choices,
+                label="Prabandham",
+                value=(_prabandham_choices[0] if _prabandham_choices else None),
+            )
+            btn = gr.Button("Initialize")
         with gr.Column(scale=4):
-            out_html = gr.HTML()
+            out = gr.HTML()
 
-    s_drop.change(lambda s: gr.Dropdown(choices=get_chapters(s)), inputs=s_drop, outputs=p_drop)
-    btn.click(generate_graph, inputs=[s_drop, p_drop], outputs=out_html)
+    s_drop.change(on_scripture_change, inputs=s_drop, outputs=p_drop)
+    btn.click(generate_ui, inputs=[s_drop, p_drop], outputs=out)
 
 if __name__ == "__main__":
+    # Start the proxy server in the background
+    threading.Thread(target=run_flask, daemon=True).start()
     demo.launch()

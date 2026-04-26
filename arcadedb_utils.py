@@ -6,14 +6,23 @@ import gradio as gr
 import sqlite3
 import re
 
+from neo4j import GraphDatabase
+
 # --- 1. Setup & Environment ---
 load_dotenv()
 # Use your ArcadeDB credentials from your .env
 ARCADE_USER = os.getenv("ARCADE_USER", "root")
 ARCADE_PASS = os.getenv("ARCADE_PASSWORD")
 ARCADE_DB = os.getenv("ARCADE_DB", "BhashyamDB")
-ARCADE_URL = f"http://216.48.187.234:2480/api/v1/command/{ARCADE_DB}"
+ARCADE_HOST = os.getenv("ARCADE_HOST")
+ARCADE_URL = f"http://{ARCADE_HOST}:2480/api/v1/command/{ARCADE_DB}"
 AUTH = (ARCADE_USER, ARCADE_PASS)
+
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 def run_arcade_cypher(query, params=None):
     """Refined ArcadeDB Cypher execution."""
@@ -31,6 +40,324 @@ def run_arcade_cypher(query, params=None):
         # This will help us see exactly what's failing in the logs
         print(f"DEBUG PAYLOAD: {payload}")
         raise Exception(f"ArcadeDB Error: {response.text}")
+
+def get_neo4j_counts():
+    """Dynamically fetches all node and relationship counts from Neo4j."""
+    counts = {"nodes": {}, "relationships": {}}
+    with neo4j_driver.session() as session:
+        # Node counts per label
+        node_res = session.run("MATCH (n) UNWIND labels(n) as label RETURN label, count(*) as count")
+        for record in node_res:
+            counts["nodes"][record["label"]] = record["count"]
+        
+        # Relationship counts per type
+        rel_res = session.run("MATCH ()-[r]->() RETURN type(r) as type, count(*) as count")
+        for record in rel_res:
+            counts["relationships"][record["type"]] = record["count"]
+    return counts
+
+def get_arcade_counts(progress=None):
+    """Dynamically fetches all node and relationship counts from ArcadeDB."""
+    counts = {"nodes": {}, "relationships": {}}
+    
+    # 1. Dynamically fetch ALL node labels from ArcadeDB
+    try:
+        label_res = run_arcade_cypher("MATCH (n) RETURN DISTINCT labels(n) as labels")
+        all_labels = set()
+        for r in label_res:
+            if r.get("labels"):
+                all_labels.update(r["labels"])
+        
+        # Count each label
+        for i, label in enumerate(sorted(all_labels)):
+            res = run_arcade_cypher(f"MATCH (n:{label}) RETURN count(n) as count")
+            counts["nodes"][label] = res[0]["count"] if res else 0
+    except Exception as e:
+        print(f"[ERROR] Could not fetch ArcadeDB labels: {e}")
+
+    # 2. Dynamically fetch ALL relationship types from ArcadeDB
+    try:
+        rel_type_res = run_arcade_cypher("MATCH ()-[r]->() RETURN DISTINCT type(r) as type")
+        all_rels = [r["type"] for r in rel_type_res if r.get("type")]
+        
+        for i, rel in enumerate(sorted(all_rels)):
+            res = run_arcade_cypher(f"MATCH ()-[r:{rel}]->() RETURN count(r) as count")
+            counts["relationships"][rel] = res[0]["count"] if res else 0
+    except Exception as e:
+        print(f"[ERROR] Could not fetch ArcadeDB relationships: {e}")
+        
+    return counts
+
+def get_neo4j_counts():
+    """Dynamically fetches all node and relationship counts from Neo4j."""
+    counts = {"nodes": {}, "relationships": {}}
+    with neo4j_driver.session() as session:
+        # Node counts per label
+        node_res = session.run("MATCH (n) UNWIND labels(n) as label RETURN label, count(*) as count")
+        for record in node_res:
+            counts["nodes"][record["label"]] = record["count"]
+        
+        # Relationship counts per type
+        rel_res = session.run("MATCH ()-[r]->() RETURN type(r) as type, count(*) as count")
+        for record in rel_res:
+            counts["relationships"][record["type"]] = record["count"]
+    return counts
+
+def get_arcade_counts(progress=None):
+    """Dynamically fetches all node and relationship counts from ArcadeDB."""
+    counts = {"nodes": {}, "relationships": {}}
+    
+    # 1. Dynamically fetch ALL node labels from ArcadeDB
+    try:
+        label_res = run_arcade_cypher("MATCH (n) RETURN DISTINCT labels(n) as labels")
+        all_labels = set()
+        for r in label_res:
+            if r.get("labels"):
+                all_labels.update(r["labels"])
+        
+        # Count each label
+        for i, label in enumerate(sorted(all_labels)):
+            res = run_arcade_cypher(f"MATCH (n:{label}) RETURN count(n) as count")
+            counts["nodes"][label] = res[0]["count"] if res else 0
+    except Exception as e:
+        print(f"[ERROR] Could not fetch ArcadeDB labels: {e}")
+
+    # 2. Dynamically fetch ALL relationship types from ArcadeDB
+    try:
+        rel_type_res = run_arcade_cypher("MATCH ()-[r]->() RETURN DISTINCT type(r) as type")
+        all_rels = [r["type"] for r in rel_type_res if r.get("type")]
+        
+        for i, rel in enumerate(sorted(all_rels)):
+            res = run_arcade_cypher(f"MATCH ()-[r:{rel}]->() RETURN count(r) as count")
+            counts["relationships"][rel] = res[0]["count"] if res else 0
+    except Exception as e:
+        print(f"[ERROR] Could not fetch ArcadeDB relationships: {e}")
+        
+    return counts
+
+# --- Reconciliation & Repair Logic ---
+
+UNIQUE_KEYS = {
+    "Verse": "global_id",
+    "Scripture": "name",
+    "Character": "name",
+    "Topic": "name",
+    "Author": "name",
+    "Location": "name"
+}
+
+REL_MAPPINGS = {
+    "PART_OF": {"src": "Verse", "src_key": "global_id", "dst": "Scripture", "dst_key": "name"},
+    "DISCUSSES": {"src": "Verse", "src_key": "global_id", "dst": "Topic", "dst_key": "name"},
+    "MENTIONS": {"src": "Verse", "src_key": "global_id", "dst": "Character", "dst_key": "name"}
+}
+
+def get_reconciliation_data():
+    """Fetches raw count data from both databases."""
+    neo = get_neo4j_counts()
+    arcade = get_arcade_counts()
+    
+    # Also fetch detailed property counts
+    with neo4j_driver.session() as session:
+        n_trans = session.run("MATCH (v:Verse) WHERE v.translation IS NOT NULL AND v.translation <> '' RETURN count(v) as c").single()["c"]
+        n_wbw = session.run("MATCH (v:Verse) WHERE v.word_by_word_native IS NOT NULL AND v.word_by_word_native <> '' AND v.word_by_word_native <> '[]' RETURN count(v) as c").single()["c"]
+        n_gid = session.run("MATCH (v:Verse) WHERE v.global_id IS NOT NULL RETURN count(v) as c").single()["c"]
+
+    a_trans = run_arcade_cypher("MATCH (v:Verse) WHERE v.translation IS NOT NULL AND v.translation <> '' RETURN count(v) as c")[0]["c"]
+    a_wbw = run_arcade_cypher("MATCH (v:Verse) WHERE v.word_by_word_native IS NOT NULL AND v.word_by_word_native <> '' AND v.word_by_word_native <> '[]' RETURN count(v) as c")[0]["c"]
+    a_gid = run_arcade_cypher("MATCH (v:Verse) WHERE v.global_id IS NOT NULL RETURN count(v) as c")[0]["c"]
+
+    detailed = [
+        {"metric": "Prop: Verse Translation", "neo": n_trans, "arcade": a_trans, "type": "property", "target": "Verse"},
+        {"metric": "Prop: Verse WBW", "neo": n_wbw, "arcade": a_wbw, "type": "property", "target": "Verse"},
+        {"metric": "Prop: Verse Global ID", "neo": n_gid, "arcade": a_gid, "type": "property", "target": "Verse"}
+    ]
+    
+    return {"neo": neo, "arcade": arcade, "detailed": detailed}
+
+def generate_recon_markdown(data, active_metric=None, active_progress=0):
+    """Generates a markdown table, highlighting the active repair row with a progress bar."""
+    report = ["### 🔍 Reconciliation Dashboard\n"]
+    report.append("| Metric | Neo4j | ArcadeDB | Status |")
+    report.append("| :--- | :---: | :---: | :---: |")
+
+    neo = data["neo"]
+    arcade = data["arcade"]
+    
+    all_labels = sorted(set(neo["nodes"].keys()) | set(arcade["nodes"].keys()))
+    all_rels = sorted(set(neo["relationships"].keys()) | set(arcade["relationships"].keys()))
+    
+    # Rows for Labels
+    for label in all_labels:
+        n = neo["nodes"].get(label, 0)
+        a = arcade["nodes"].get(label, 0)
+        metric_name = f"Node: {label}"
+        status = get_row_status(metric_name, n, a, active_metric, active_progress)
+        report.append(f"| {metric_name} | {n:,} | {a:,} | {status} |")
+
+    # Rows for Relationships
+    for rel in all_rels:
+        n = neo["relationships"].get(rel, 0)
+        a = arcade["relationships"].get(rel, 0)
+        metric_name = f"Rel: {rel}"
+        status = get_row_status(metric_name, n, a, active_metric, active_progress)
+        report.append(f"| {metric_name} | {n:,} | {a:,} | {status} |")
+
+    # Rows for Properties
+    for d in data["detailed"]:
+        metric_name = d["metric"]
+        status = get_row_status(metric_name, d["neo"], d["arcade"], active_metric, active_progress)
+        report.append(f"| {metric_name} | {d['neo']:,} | {d['arcade']:,} | {status} |")
+
+    return "\n".join(report)
+
+def get_row_status(name, n, a, active_name, progress):
+    if name == active_name:
+        # Visual progress bar in markdown
+        filled = int(progress * 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        return f"🛠️ [{bar}] {int(progress*100)}%"
+    if n == a:
+        return "✅ Match"
+    if active_name is not None:
+        return "⏳ Waiting..."
+    return f"❌ Mismatch ({a-n if a>n else n-a})"
+
+def fix_mismatches_sequentially(progress=gr.Progress()):
+    """Iteratively repairs mismatches starting with the lowest counts."""
+    print("\n[REPAIR] Starting sequential repair process...")
+    data = get_reconciliation_data()
+    
+    # 1. Identify mismatches and sort by absolute difference
+    mismatches = []
+    
+    # Labels
+    for label, n in data["neo"]["nodes"].items():
+        a = data["arcade"]["nodes"].get(label, 0)
+        if n != a: mismatches.append({"type": "node", "target": label, "count": abs(n-a), "name": f"Node: {label}"})
+    
+    # Relationships
+    for rel, n in data["neo"]["relationships"].items():
+        a = data["arcade"]["relationships"].get(rel, 0)
+        if n != a: mismatches.append({"type": "rel", "target": rel, "count": abs(n-a), "name": f"Rel: {rel}"})
+    
+    # Properties (Detailed)
+    for d in data["detailed"]:
+        if d["neo"] != d["arcade"]:
+            mismatches.append({"type": "property", "target": d["target"], "count": abs(d["neo"] - d["arcade"]), "name": d["metric"]})
+
+    # Sort: Lowest counts first (lowest hanging fruit)
+    mismatches.sort(key=lambda x: x["count"])
+    
+    if not mismatches:
+        return generate_recon_markdown(data) + "\n\n### 🎉 Everything is already in sync!"
+
+    # 2. Iterate and Fix
+    for m in mismatches:
+        print(f"[REPAIR] Addressing {m['name']} ({m['count']} items)...")
+        
+        # Update UI to show we are starting this row
+        yield generate_recon_markdown(data, active_metric=m["name"], active_progress=0)
+        
+        # Perform repair
+        if m["type"] == "node":
+            for p in sync_label(m["target"]):
+                yield generate_recon_markdown(data, active_metric=m["name"], active_progress=p)
+        elif m["type"] == "rel":
+            for p in sync_relationship(m["target"]):
+                yield generate_recon_markdown(data, active_metric=m["name"], active_progress=p)
+        elif m["type"] == "property":
+            # Property repairs usually covered by node sync, but we can do a targeted one
+            for p in sync_label(m["target"]):
+                yield generate_recon_markdown(data, active_metric=m["name"], active_progress=p)
+
+        # Refresh data for this specific metric after fix
+        data = get_reconciliation_data()
+        yield generate_recon_markdown(data)
+
+    print("[REPAIR] Sequential repair complete.")
+    return generate_recon_markdown(data) + "\n\n### ✅ Sequential repair complete!"
+
+def sync_label(label):
+    """Generic node sync for a label."""
+    key = UNIQUE_KEYS.get(label, "name")
+    with neo4j_driver.session() as session:
+        # Fetch all from Neo4j
+        res = session.run(f"MATCH (n:{label}) RETURN n").data()
+    
+    total = len(res)
+    if total == 0: return
+    
+    BATCH_SIZE = 500
+    for i in range(0, total, BATCH_SIZE):
+        batch = [r["n"] for r in res[i : i + BATCH_SIZE]]
+        # Upsert
+        run_arcade_cypher(f"""
+            UNWIND $batch AS props
+            MERGE (n:{label} {{{key}: props.{key}}})
+            SET n += props
+        """, {"batch": batch})
+        yield (i + len(batch)) / total
+
+def sync_relationship(rel_type):
+    """Generic relationship sync for a type."""
+    m = REL_MAPPINGS.get(rel_type)
+    if not m:
+        print(f"[WARN] No mapping for relationship {rel_type}. Skipping.")
+        return
+
+    with neo4j_driver.session() as session:
+        res = session.run(f"""
+            MATCH (a:{m['src']})-[r:{rel_type}]->(b:{m['dst']})
+            RETURN a.{m['src_key']} as src_val, b.{m['dst_key']} as dst_val
+        """).data()
+    
+    total = len(res)
+    if total == 0: return
+    
+    BATCH_SIZE = 500
+    for i in range(0, total, BATCH_SIZE):
+        batch = res[i : i + BATCH_SIZE]
+        run_arcade_cypher(f"""
+            UNWIND $batch AS item
+            MATCH (a:{m['src']} {{{m['src_key']}: item.src_val}}), (b:{m['dst']} {{{m['dst_key']}: item.dst_val}})
+            MERGE (a)-[:{rel_type}]->(b)
+        """, {"batch": batch})
+        yield (i + len(batch)) / total
+
+def reconcile_neo4j_with_arcade(progress=gr.Progress()):
+    """
+    Compatibility wrapper for the Run Reconciliation button.
+    Returns (Markdown Report, gr.update for Fix Button)
+    """
+    print("[SYSTEM] Running auto-reconciliation...")
+    data = get_reconciliation_data()
+    md = generate_recon_markdown(data)
+    
+    # Determine if there are any mismatches
+    has_mismatches = False
+    
+    # 1. Check Nodes
+    for label, n in data["neo"]["nodes"].items():
+        if n != data["arcade"]["nodes"].get(label, 0):
+            has_mismatches = True
+            break
+            
+    # 2. Check Relationships (if no node mismatch)
+    if not has_mismatches:
+        for rel, n in data["neo"]["relationships"].items():
+            if n != data["arcade"]["relationships"].get(rel, 0):
+                has_mismatches = True
+                break
+                
+    # 3. Check Detailed Properties (if no other mismatch)
+    if not has_mismatches:
+        for d in data["detailed"]:
+            if d["neo"] != d["arcade"]:
+                has_mismatches = True
+                break
+                
+    return md, gr.update(interactive=has_mismatches)
 
 # --- 2. Refactored Functions ---
 
