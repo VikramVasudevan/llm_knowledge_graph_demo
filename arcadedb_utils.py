@@ -744,7 +744,7 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
         # 1. Fetch metadata using ArcadeDB helper
         s_result = run_arcade_cypher("MATCH (s:Scripture) RETURN s.name AS name")
         available_scriptures = [record["name"] for record in s_result]
-        
+
         a_result = run_arcade_cypher("MATCH (a:Author) RETURN a.name AS name LIMIT 100")
         available_authors = [record["name"] for record in a_result]
     except Exception as e:
@@ -767,9 +767,8 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
     ents = json.loads(response.choices[0].message.content)
 
     # 3. Build Search Params
-    keywords = ents.get("search_keywords", [])
-    # ArcadeDB Lucene syntax for fuzzy search
-    search_string = " OR ".join([f"{k}~2" for k in keywords if k])
+    keywords = [k.strip() for k in ents.get("search_keywords", []) if k.strip()]
+    search_string = " OR ".join([f"{k}~2" for k in keywords])
 
     params = {
         "scriptures": ents.get("scriptures", []),
@@ -777,69 +776,89 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
         "topics": [t.strip().title() for t in ents.get("topics", [])],
         "characters": [c.strip().title() for c in ents.get("characters", [])],
         "search_string": search_string,
-        "use_fts": use_fts
+        "keywords": keywords
     }
 
-    # 4. ArcadeDB Optimized Cypher (Lucene + Graph)
-    # Note: Replace 'VerseTextIndex' with the actual name of your Lucene index
-    cypher_query = """
-    // 1. Identify Graph matches using size() for speed
-    MATCH (v:Verse)
-    WHERE size([ (v)-[:MENTIONS]->(c:Character) WHERE toLower(c.name) IN [x IN $characters | toLower(x)] | c ]) > 0
-    WITH collect(DISTINCT v) AS char_verses
-    
-    MATCH (v:Verse)
-    WHERE size([ (v)-[:DISCUSSES]->(t:Topic) WHERE toLower(t.name) IN [x IN $topics | toLower(x)] | t ]) > 0
-    WITH char_verses, collect(DISTINCT v) AS top_verses
+    context_data_map = {} # Using a map to deduplicate results
 
-    // 2. Combine with Full-Text Search
-    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
-    WHERE v IN char_verses 
-       OR v IN top_verses 
-       OR ($use_fts = true AND v SEARCH $search_string)
+    def add_to_context(records):
+        for record in records:
+            # Create a unique key for deduplication
+            key = f"{record.get('scripture')}:{record.get('verse_title')}"
+            if key not in context_data_map:
+                context_data_map[key] = {
+                    "scripture": record.get("scripture", "Unknown"),
+                    "verse": record.get("verse_title", "N/A"),
+                    "verse_text": record.get("verse_text", ""),
+                    "meaning": f"{record.get('meaning') or ''}\n{format_wbw(record.get('wbw'))}",
+                }
 
-    WITH v, s, char_verses, top_verses
-    
-    // 3. Simple Scoring (ArcadeDB provides 'score()' if using a native SEARCH block)
-    WITH v, s,
-         (CASE WHEN v IN char_verses THEN 5000 ELSE 0 END) AS char_boost,
-         (CASE WHEN v IN top_verses THEN 1000 ELSE 0 END) AS topic_boost
-         
-    WITH v, s, (char_boost + topic_boost) AS total_score
-    ORDER BY total_score DESC
-    LIMIT 15
-    
-    RETURN s.title AS scripture, v.relative_path AS verse_title, 
-           v.text AS verse_text, v.translation AS meaning, 
-           v.word_by_word_native AS wbw
-    """
-
-    context_data = []
     try:
-        # Fallback if no keywords were identified
-        active_query = cypher_query if params["search_string"] else """
+        # PHASE 1: Graph-based relationship matches (Highly reliable)
+        if params["characters"] or params["topics"] or params["scriptures"]:
+            graph_query = """
             MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
-            WHERE (size($topics) > 0 AND size([ (v)-[:DISCUSSES]->(t:Topic) WHERE t.name IN $topics | t ]) > 0)
-               OR (size($scriptures) > 0 AND s.name IN $scriptures)
+            WHERE 
+                (size($characters) > 0 AND size([(v)-[:MENTIONS]->(c:Character) WHERE toLower(c.name) IN [x IN $characters | toLower(x)] | c]) > 0)
+                OR 
+                (size($topics) > 0 AND size([(v)-[:DISCUSSES]->(t:Topic) WHERE toLower(t.name) IN [x IN $topics | toLower(x)] | t]) > 0)
+                OR
+                (s.name IN $scriptures)
+            RETURN s.title AS scripture, v.relative_path AS verse_title, 
+                   v.text AS verse_text, v.translation AS meaning, 
+                   v.word_by_word_native AS wbw
+            LIMIT 20
+            """
+            graph_results = run_arcade_cypher(graph_query, params)
+            add_to_context(graph_results)
+
+        # PHASE 2: Full-Text Search (if enabled and we need more results)
+        if use_fts and params["search_string"] and len(context_data_map) < 15:
+            # We use a very simple query for FTS to avoid parser syntax issues
+            fts_query = """
+            MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+            WHERE v SEARCH $search_string
+            RETURN s.title AS scripture, v.relative_path AS verse_title, 
+                   v.text AS verse_text, v.translation AS meaning, 
+                   v.word_by_word_native AS wbw
+            LIMIT 15
+            """
+            try:
+                fts_results = run_arcade_cypher(fts_query, {"search_string": params["search_string"]})
+                add_to_context(fts_results)
+            except Exception as fts_err:
+                print(f"FTS Search Error (Skipping): {fts_err}")
+                # Fallback to simple CONTAINS if FTS fails
+                if keywords:
+                    fallback_query = """
+                    MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+                    WHERE ANY(k IN $keywords WHERE toLower(v.text) CONTAINS toLower(k))
+                    RETURN s.title AS scripture, v.relative_path AS verse_title, 
+                           v.text AS verse_text, v.translation AS meaning, 
+                           v.word_by_word_native AS wbw
+                    LIMIT 10
+                    """
+                    fallback_results = run_arcade_cypher(fallback_query, {"keywords": keywords})
+                    add_to_context(fallback_results)
+
+        # PHASE 3: Fallback to general interesting verses if still empty
+        if not context_data_map:
+            fallback_query = """
+            MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
+            WHERE size((v)-[:DISCUSSES]->()) > 0
             RETURN s.title AS scripture, v.relative_path AS verse_title, 
                    v.text AS verse_text, v.translation AS meaning, 
                    v.word_by_word_native AS wbw
             ORDER BY size((v)-[:DISCUSSES]->()) DESC
-            LIMIT 15
-        """
-        
-        result = run_arcade_cypher(active_query, params)
-        for record in result:
-            context_data.append({
-                "scripture": record.get("scripture", "Unknown"),
-                "verse": record.get("verse_title", "N/A"),
-                "verse_text": record.get("verse_text", ""),
-                "meaning": f"{record.get('meaning') or ''}\n{format_wbw(record.get('wbw'))}",
-            })
+            LIMIT 10
+            """
+            fallback_results = run_arcade_cypher(fallback_query)
+            add_to_context(fallback_results)
+
     except Exception as e:
         print(f"Chat Search Error: {e}")
 
-    return context_data, params        
+    return list(context_data_map.values()), params
 
 def update_topic_everywhere_arcade(old_name, new_name):
     new_topics_list = [t.strip() for t in new_name.split(",") if t.strip()]
