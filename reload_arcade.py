@@ -70,16 +70,22 @@ def optimized_sync_label(label):
         for record in result:
             if INTERRUPTED: return False
             
-            # Extract dictionary and explicitly filter out any non-serializable objects
+            # Extract dictionary and filter serializable
             node = record["n"]
             props = dict(node)
             clean_props = {k: v for k, v in props.items() if isinstance(v, (str, int, float, list, dict, bool, type(None)))}
             
-            # Perform granular MERGE to avoid parameter parsing complexity
-            run_arcade_cypher(f"""
-                MERGE (n:{label} {{{key}: $val}})
-                SET n += $props
-            """, {"val": clean_props.get(key), "props": clean_props})
+            # Use manual property setting to avoid map-merging errors
+            # We filter out the unique key to avoid redundant assignment
+            set_clauses = [f"n.{k} = $p.{k}" for k in clean_props.keys() if k != key]
+            set_clause = ", ".join(set_clauses)
+            
+            # If there are properties to set, run the SET clause; otherwise, just MERGE
+            query = f"MERGE (n:{label} {{{key}: $p.{key}}})"
+            if set_clause:
+                query += f" SET {set_clause}"
+                
+            run_arcade_cypher(query, {"p": clean_props})
             
             count += 1
             if count % 100 == 0:
