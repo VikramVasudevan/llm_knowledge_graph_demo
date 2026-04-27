@@ -72,6 +72,9 @@ def import_edges_from_map(jsonl_path, rid_map_path):
                 if s_rid and e_rid:
                     edge_batch.append(f"CREATE EDGE {label} FROM {s_rid} TO {e_rid}")
                     edge_count += 1
+                else:
+                    if not s_rid: print(f"  ⚠️ Missing source RID for {s_label or '???'}:{s_id}")
+                    if not e_rid: print(f"  ⚠️ Missing target RID for {e_label or '???'}:{e_id}")
                 
                 if len(edge_batch) >= BATCH_SIZE:
                     if run_script("BEGIN; " + " ; ".join(edge_batch) + "; COMMIT;"):
