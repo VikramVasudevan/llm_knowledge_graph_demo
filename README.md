@@ -76,6 +76,7 @@ Bhashyam AI is an advanced research platform designed for the exploration and an
 - `app_vis.py`: Neo4j-based scripture hierarchy visualization.
 - `app_vis_arcade.py`: ArcadeDB-based scripture hierarchy visualization with dynamic drill-down support.
 - `arcadedb_utils.py`: Utility functions for ArcadeDB operations.
+- `reload_arcade.py`: Maintenance script to cleanup ArcadeDB and perform a full reload from Neo4j.
 - `lib/`: Contains custom JavaScript and CSS for advanced UI components (Tom-Select, Vis-Network).
 - `pyproject.toml`: Project metadata and dependency definitions.
 

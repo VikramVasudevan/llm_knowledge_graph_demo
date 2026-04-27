@@ -18,6 +18,10 @@ ARCADE_HOST = os.getenv("ARCADE_HOST")
 ARCADE_URL = f"http://{ARCADE_HOST}:2480/api/v1/command/{ARCADE_DB}"
 AUTH = (ARCADE_USER, ARCADE_PASS)
 
+# Persistent session for performance
+arcade_session = requests.Session()
+arcade_session.auth = AUTH
+
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
@@ -25,21 +29,44 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 def run_arcade_cypher(query, params=None):
-    """Refined ArcadeDB Cypher execution."""
-    # ArcadeDB sometimes prefers parameters without the '$' in the key,
-    # but with the '$' in the query string.
+    """Refined ArcadeDB Cypher execution with persistent session and timeout."""
     payload = {
         "language": "cypher",
         "command": query,
         "params": params if params else {}
     }
-    response = requests.post(ARCADE_URL, json=payload, auth=AUTH)
+    # 30s timeout to ensure it doesn't hang forever
+    response = arcade_session.post(ARCADE_URL, json=payload, timeout=30)
     if response.status_code == 200:
         return response.json().get("result", [])
     else:
-        # This will help us see exactly what's failing in the logs
         print(f"DEBUG PAYLOAD: {payload}")
         raise Exception(f"ArcadeDB Error: {response.text}")
+
+def run_arcade_sql(command, params=None):
+    """Executes native ArcadeDB SQL commands with timeout."""
+    payload = {
+        "language": "sql",
+        "command": command,
+        "params": params if params else {}
+    }
+    response = arcade_session.post(ARCADE_URL, json=payload, timeout=30)
+    if response.status_code == 200:
+        return response.json().get("result", [])
+    else:
+        raise Exception(f"ArcadeDB SQL Error: {response.text}")
+
+def ensure_arcade_indexes():
+    """Ensures indexes exist for keys used in MERGE operations to prevent performance degradation."""
+    print("🛠️ Ensuring ArcadeDB indexes...")
+    for label, key in UNIQUE_KEYS.items():
+        try:
+            # Native ArcadeDB SQL is the preferred way for schema operations
+            # syntax: CREATE INDEX IF NOT EXISTS ON <Type> (<prop>) UNIQUE
+            run_arcade_sql(f"CREATE INDEX IF NOT EXISTS ON `{label}` (`{key}`) UNIQUE")
+            print(f"  - Index ensured: {label}({key})")
+        except Exception as e:
+            print(f"  - ⚠️ Could not create index for {label}: {e}")
 
 def get_neo4j_counts():
     """Dynamically fetches all node and relationship counts from Neo4j."""
