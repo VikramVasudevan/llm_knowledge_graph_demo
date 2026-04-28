@@ -69,7 +69,7 @@ def bhashyam_chat(message, history, use_fts):
             {formatted_context}
             """
         stream = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": message},
