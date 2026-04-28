@@ -766,7 +766,7 @@ def get_all_topics_table_arcade(search_query=""):
         print(f"Topic Table Error: {e}")
         return [[f"Error: {e}", 0]]        
 
-def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
+def get_perspectives_from_graph_arcade(client, user_query, conversation_history=None, use_fts=True):
     try:
         # 1. Fetch metadata using ArcadeDB helper
         s_result = run_arcade_cypher("MATCH (s:Scripture) RETURN s.name AS name")
@@ -778,12 +778,23 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
         print(f"Error fetching metadata: {e}")
         return [], {}
 
-    # 2. LLM Extraction (Remains the same as your Neo4j version)
+    # 2. LLM Extraction with History
+    history_str = ""
+    if conversation_history:
+        history_str = "HISTORY:\n" + "\n".join([f"{h['role'].upper()}: {h['content']}" for h in conversation_history[-3:]])
+
     extraction_prompt = f"""
     Identify entities and search keywords in the user query.
     VALID SCRIPTURES: {available_scriptures}
     VALID AUTHORS: {available_authors}
+    {history_str}
     Question: "{user_query}"
+    
+    INSTRUCTIONS:
+    - Extract Scriptures, Authors, Characters, and Topics.
+    - DO NOT include "Topic" or "same topic" as a topic name.
+    - If the user refers to "the same topic", look at the HISTORY to find the topic mentioned in previous turns and include that in the 'topics' list.
+    
     Return JSON: {{ "scriptures": [], "authors": [], "characters": [], "topics": [], "search_keywords": [] }}
     """
     response = client.chat.completions.create(
@@ -797,10 +808,20 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
     keywords = [k.strip() for k in ents.get("search_keywords", []) if k.strip()]
     search_string = " OR ".join([f"{k}~2" for k in keywords])
 
+    extracted_topics = [t.strip().title() for t in ents.get("topics", [])]
+    
+    # Fallback: If no formal topics, look at keywords for likely candidates,
+    # excluding those we already identified as scriptures or authors.
+    final_topics = extracted_topics
+    if not final_topics and keywords:
+        candidates = [k for k in keywords if k.title() not in available_scriptures and k.title() not in available_authors]
+        if candidates:
+            final_topics = [candidates[0].title()]
+
     params = {
         "scriptures": ents.get("scriptures", []),
         "authors": ents.get("authors", []),
-        "topics": [t.strip().title() for t in ents.get("topics", [])],
+        "topics": final_topics,
         "characters": [c.strip().title() for c in ents.get("characters", [])],
         "search_string": search_string,
         "keywords": keywords
@@ -823,14 +844,20 @@ def get_perspectives_from_graph_arcade(client, user_query, use_fts=True):
     try:
         # PHASE 1: Graph-based relationship matches (Highly reliable)
         if params["characters"] or params["topics"] or params["scriptures"]:
-            graph_query = """
+            print("Querying based on metadata ...")
+            
+            # If scriptures are provided, enforce them. If not, allow any.
+            if params["scriptures"]:
+                scripture_filter = "s.name IN $scriptures"
+            else:
+                scripture_filter = "1=1" # No restriction
+
+            graph_query = f"""
             MATCH (v:Verse)-[:PART_OF]->(s:Scripture)
             WHERE 
-                (size($characters) > 0 AND size([(v)-[:MENTIONS]->(c:Character) WHERE toLower(c.name) IN [x IN $characters | toLower(x)] | c]) > 0)
-                OR 
-                (size($topics) > 0 AND size([(v)-[:DISCUSSES]->(t:Topic) WHERE toLower(t.name) IN [x IN $topics | toLower(x)] | t]) > 0)
-                OR
-                (s.name IN $scriptures)
+                {scripture_filter}
+                AND (size($characters) = 0 OR size([(v)-[:MENTIONS]->(c:Character) WHERE toLower(c.name) IN [x IN $characters | toLower(x)] | c]) > 0)
+                AND (size($topics) = 0 OR size([(v)-[:DISCUSSES]->(t:Topic) WHERE toLower(t.name) IN [x IN $topics | toLower(x)] | t]) > 0)
             RETURN s.title AS scripture, v.relative_path AS verse_title, 
                    v.text AS verse_text, v.translation AS meaning, 
                    v.word_by_word_native AS wbw

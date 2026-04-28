@@ -73,13 +73,13 @@ def get_all_topics_table(search_query=""):
 
 
 # --- 3. Original Perspectives & Chat Logic ---
-def get_perspectives_from_graph(user_query, use_fts=True):
-    return get_perspectives_from_graph_arcade(client=client, user_query=user_query, use_fts=use_fts)
+def get_perspectives_from_graph(user_query, history, use_fts=True):
+    return get_perspectives_from_graph_arcade(client=client, user_query=user_query, conversation_history=history, use_fts=use_fts)
 
 
 def bhashyam_chat(message, history, use_fts):
     try:
-        context, identified_topics = get_perspectives_from_graph(message, use_fts)
+        context, identified_topics = get_perspectives_from_graph(message, history, use_fts)
         print("context:\n", context)
         print("identified_topics:\n", identified_topics)
         if not context:
@@ -116,6 +116,7 @@ def bhashyam_chat(message, history, use_fts):
                 {"role": "user", "content": message},
             ],
             stream=True,
+            temperature=0.2
         )
         partial_message = ""
         for chunk in stream:
