@@ -868,6 +868,7 @@ def get_perspectives_from_graph_arcade(client, user_query, conversation_history=
 
         # PHASE 2: Full-Text Search (if enabled and we need more results)
         if use_fts and params["search_string"] and len(context_data_map) < 15:
+            print("Querying based on FTS ...")
             # We use a very simple query for FTS to avoid parser syntax issues
             fts_query = """
             MATCH (v:Verse)-[:PART_OF]->(s:Scripture)

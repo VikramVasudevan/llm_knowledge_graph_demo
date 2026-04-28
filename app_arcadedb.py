@@ -209,6 +209,7 @@ with gr.Blocks() as demo:
                         interactive=False,
                         # Redistributed: Metadata (20% total), Content (80% total)
                         column_widths=["10%", "10%", "25%", "25%", "30%"],
+                        show_search="search"
                     )
 
         # --- Tab 2.5: Character Index ---
